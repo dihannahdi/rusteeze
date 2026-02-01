@@ -1,0 +1,146 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # Rusteeze Inference Server
+  # ============================================================================
+  rusteeze:
+    image: dihannahdi/rusteeze:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime  # or cuda-runtime for GPU
+    container_name: rusteeze
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - huggingface_cache:/data/huggingface
+      - ./models:/models:ro
+    environment:
+      - RUSTEEZE_HOST=0.0.0.0
+      - RUSTEEZE_PORT=8000
+      - LOG_LEVEL=info
+      - HF_HOME=/data/huggingface
+      # - RUSTEEZE_API_KEY=your-secret-key
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - rusteeze-network
+
+  # ============================================================================
+  # Rusteeze with GPU Support
+  # ============================================================================
+  rusteeze-gpu:
+    image: dihannahdi/rusteeze:cuda
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cuda-runtime
+    container_name: rusteeze-gpu
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - huggingface_cache:/data/huggingface
+      - ./models:/models:ro
+    environment:
+      - RUSTEEZE_HOST=0.0.0.0
+      - RUSTEEZE_PORT=8000
+      - LOG_LEVEL=info
+      - HF_HOME=/data/huggingface
+      - CUDA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - rusteeze-network
+    profiles:
+      - gpu
+
+  # ============================================================================
+  # Prometheus (Optional Monitoring)
+  # ============================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - rusteeze-network
+    profiles:
+      - monitoring
+
+  # ============================================================================
+  # Grafana (Optional Dashboards)
+  # ============================================================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    networks:
+      - rusteeze-network
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+  # ============================================================================
+  # Jaeger (Optional Tracing)
+  # ============================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: jaeger
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+    networks:
+      - rusteeze-network
+    profiles:
+      - tracing
+
+networks:
+  rusteeze-network:
+    driver: bridge
+
+volumes:
+  huggingface_cache:
+  prometheus_data:
+  grafana_data:

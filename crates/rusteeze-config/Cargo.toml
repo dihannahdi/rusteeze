@@ -1,0 +1,32 @@
+[package]
+name = "rusteeze-config"
+version = "0.1.0"
+edition = "2021"
+description = "Configuration management for Rusteeze LLM inference engine"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+toml = "0.8"
+
+# Environment
+dotenvy = "0.15"
+
+# Validation
+validator = { version = "0.18", features = ["derive"] }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Internal
+rusteeze-core = { path = "../rusteeze-core" }
+
+[dev-dependencies]
+tempfile = "3.10"

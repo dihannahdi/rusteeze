@@ -1,0 +1,46 @@
+[package]
+name = "rusteeze-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for Rusteeze LLM inference engine"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[[bin]]
+name = "rusteeze"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+dialoguer = "0.11"
+indicatif = "0.17"
+console = "0.15"
+colored = "2.1"
+
+# Async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = "1.0"
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Internal crates
+rusteeze-core = { path = "../rusteeze-core" }
+rusteeze-config = { path = "../rusteeze-config" }
+rusteeze-engine = { path = "../rusteeze-engine" }
+rusteeze-api = { path = "../rusteeze-api" }
+rusteeze-metrics = { path = "../rusteeze-metrics" }
+rusteeze-model = { path = "../rusteeze-model" }
+rusteeze-tokenizer = { path = "../rusteeze-tokenizer" }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"

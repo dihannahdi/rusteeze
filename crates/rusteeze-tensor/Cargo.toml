@@ -1,0 +1,51 @@
+[package]
+name = "rusteeze-tensor"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor operations and GPU kernels for Rusteeze LLM inference engine"
+license = "Apache-2.0"
+repository = "https://github.com/dihannahdi/rusteeze"
+keywords = ["llm", "inference", "tensor", "cuda", "gpu"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+rusteeze-core = { path = "../rusteeze-core" }
+
+# Tensor operations
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# Numeric types
+half = { workspace = true }
+bytemuck = { workspace = true }
+num-traits = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Utilities
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+# Memory mapping
+memmap2 = { workspace = true }
+
+# Random
+rand = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.4"
+approx = "0.5"
+
+[[bench]]
+name = "tensor_ops"
+harness = false
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
+accelerate = ["candle-core/accelerate"]
+mkl = ["candle-core/mkl"]

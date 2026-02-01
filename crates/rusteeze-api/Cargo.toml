@@ -1,0 +1,43 @@
+[package]
+name = "rusteeze-api"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusteeze Team"]
+license = "Apache-2.0"
+description = "OpenAI-compatible REST API for the Rusteeze LLM inference engine"
+repository = "https://github.com/dihannahdi/rusteeze"
+keywords = ["llm", "api", "openai", "rest"]
+categories = ["web-programming"]
+
+[dependencies]
+# Core types
+rusteeze-core = { path = "../rusteeze-core" }
+rusteeze-engine = { path = "../rusteeze-engine" }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { version = "0.1" }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging and metrics
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+
+[dev-dependencies]
+axum-test = "0.9"

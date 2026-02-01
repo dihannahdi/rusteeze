@@ -1,0 +1,49 @@
+[package]
+name = "rusteeze-model"
+version = "0.1.0"
+edition = "2021"
+description = "Model loading and architectures for Rusteeze LLM inference engine"
+license = "Apache-2.0"
+repository = "https://github.com/dihannahdi/rusteeze"
+keywords = ["llm", "inference", "transformer", "model", "ai"]
+categories = ["science", "machine-learning"]
+
+[dependencies]
+rusteeze-core = { path = "../rusteeze-core" }
+rusteeze-tensor = { path = "../rusteeze-tensor" }
+
+# Tensor operations
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+
+# Model loading
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Utilities
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+half = { workspace = true }
+num-traits = { workspace = true }
+
+# HuggingFace Hub (optional)
+hf-hub = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "rusteeze-tensor/cuda"]
+metal = ["candle-core/metal", "rusteeze-tensor/metal"]
+accelerate = ["candle-core/accelerate", "rusteeze-tensor/accelerate"]
+hub = ["hf-hub"]

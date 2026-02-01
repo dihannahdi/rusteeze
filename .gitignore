@@ -1,0 +1,86 @@
+# Rusteeze Build Artifacts
+/target/
+/dist/
+*.rlib
+*.rmeta
+
+# Cargo lock - keep for binary crates
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+
+# Test coverage
+coverage/
+*.profdata
+*.profraw
+lcov.info
+
+# Benchmarks output
+benches/output/
+criterion/
+
+# Documentation build
+docs/book/
+docs/api/
+
+# Model cache (can be large)
+models/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+*.onnx
+
+# HuggingFace cache
+.cache/
+
+# Python artifacts (for testing)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+
+# Docker
+.docker/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Backup files
+*.bak
+*.orig
+
+# Debug
+debug/
+*.dSYM/
+
+# CUDA compilation
+*.cubin
+*.fatbin
+*.ptx

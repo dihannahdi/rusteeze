@@ -1,0 +1,59 @@
+[package]
+name = "rusteeze-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusteeze Team"]
+license = "Apache-2.0"
+description = "Core inference engine for the Rusteeze LLM inference engine"
+repository = "https://github.com/dihannahdi/rusteeze"
+keywords = ["llm", "inference", "engine", "transformers"]
+categories = ["science"]
+
+[dependencies]
+# Core types
+rusteeze-core = { path = "../rusteeze-core" }
+rusteeze-model = { path = "../rusteeze-model" }
+rusteeze-tensor = { path = "../rusteeze-tensor" }
+rusteeze-tokenizer = { path = "../rusteeze-tokenizer" }
+
+# Tensor operations
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { version = "0.1" }
+
+# Channels and concurrency
+crossbeam-channel = "0.5"
+flume = "0.11"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging and metrics
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+# Utilities
+parking_lot = { workspace = true }
+uuid = { version = "1.11", features = ["v4"] }
+rand = "0.8"
+indexmap = "2.7"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.5"
+
+[features]
+default = []
+cuda = ["rusteeze-tensor/cuda", "candle-core/cuda"]
+metal = ["rusteeze-tensor/metal", "candle-core/metal"]
+
+[[bench]]
+name = "scheduler"
+harness = false

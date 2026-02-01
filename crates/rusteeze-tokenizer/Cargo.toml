@@ -1,0 +1,39 @@
+[package]
+name = "rusteeze-tokenizer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusteeze Team"]
+license = "Apache-2.0"
+description = "Tokenization for the Rusteeze LLM inference engine"
+repository = "https://github.com/dihannahdi/rusteeze"
+keywords = ["llm", "tokenizer", "inference", "transformers"]
+categories = ["text-processing", "science"]
+
+[dependencies]
+# Core types
+rusteeze-core = { path = "../rusteeze-core" }
+
+# Tokenization
+tokenizers = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[features]
+default = []

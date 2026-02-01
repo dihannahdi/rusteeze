@@ -1,0 +1,37 @@
+[package]
+name = "rusteeze-metrics"
+version = "0.1.0"
+edition = "2021"
+description = "Metrics and observability for Rusteeze LLM inference engine"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[dependencies]
+# Metrics
+prometheus = "0.13"
+metrics = "0.22"
+metrics-exporter-prometheus = "0.14"
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.22"
+opentelemetry = "0.21"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["tonic"] }
+
+# Async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = "0.4"
+
+# Error handling
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

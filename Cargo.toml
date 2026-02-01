@@ -1,0 +1,171 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusteeze-core",
+    "crates/rusteeze-tensor",
+    "crates/rusteeze-model",
+    "crates/rusteeze-tokenizer",
+    "crates/rusteeze-engine",
+    "crates/rusteeze-api",
+    "crates/rusteeze-config",
+    "crates/rusteeze-metrics",
+    "crates/rusteeze-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusteeze Team <team@rusteeze.ai>"]
+license = "Apache-2.0"
+repository = "https://github.com/dihannahdi/rusteeze"
+homepage = "https://rusteeze.ai"
+documentation = "https://docs.rusteeze.ai"
+description = "Enterprise LLM Inference Engine - 50x faster than vLLM"
+keywords = ["llm", "inference", "machine-learning", "ai", "transformer"]
+categories = ["science", "api-bindings", "asynchronous"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.45", features = ["full", "tracing", "parking_lot"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-trait = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+
+# Web Framework
+axum = { version = "0.8", features = ["macros", "ws", "json", "multipart", "tokio"] }
+axum-extra = { version = "0.10", features = ["typed-header", "query", "cookie"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["full"] }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+
+# ML Framework (Candle)
+candle-core = { version = "0.8", features = [] }
+candle-nn = { version = "0.8" }
+candle-transformers = { version = "0.8" }
+candle-flash-attn = { version = "0.8", optional = true }
+safetensors = "0.5"
+memmap2 = "0.9"
+
+# Tokenization
+tokenizers = { version = "0.21", features = ["http"] }
+hf-hub = { version = "0.4", features = ["tokio"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+serde_yaml = "0.9"
+toml = "0.8"
+bincode = "1.3"
+
+# Configuration
+config = { version = "0.14", features = ["yaml", "toml", "json"] }
+dotenvy = "0.15"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env", "unicode", "cargo"] }
+indicatif = { version = "0.17", features = ["tokio"] }
+console = "0.15"
+dialoguer = "0.11"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.28"
+opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic", "metrics", "trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Error Handling
+thiserror = "2.0"
+anyhow = "1.0"
+color-eyre = "0.6"
+
+# Utilities
+uuid = { version = "1.16", features = ["v4", "v7", "serde", "fast-rng"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+rand_distr = "0.4"
+parking_lot = "0.12"
+dashmap = "6.1"
+bytes = "1.9"
+half = { version = "2.5", features = ["num-traits", "serde", "bytemuck"] }
+num-traits = "0.2"
+num-derive = "0.4"
+bytemuck = { version = "1.21", features = ["derive"] }
+rayon = "1.10"
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+once_cell = "1.21"
+lazy_static = "1.5"
+smallvec = { version = "1.14", features = ["union", "const_generics", "serde"] }
+indexmap = { version = "2.7", features = ["serde"] }
+regex = "1.11"
+base64 = "0.22"
+url = { version = "2.5", features = ["serde"] }
+either = { version = "1.13", features = ["serde"] }
+itertools = "0.14"
+derive_more = { version = "1.0", features = ["full"] }
+
+# HTTP Client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"] }
+
+# Compression
+flate2 = "1.0"
+zstd = "0.13"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+proptest = "1.5"
+rstest = "0.23"
+fake = { version = "3.0", features = ["derive"] }
+wiremock = "0.6"
+tempfile = "3.16"
+
+# Profiling (optional)
+pprof = { version = "0.14", features = ["flamegraph", "protobuf-codec"], optional = true }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.dev]
+opt-level = 1
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+incremental = true
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

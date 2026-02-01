@@ -1,0 +1,148 @@
+# Rusteeze Configuration Example
+# Copy this to rusteeze.yaml and customize
+
+model:
+  # Model path (local path or HuggingFace repo ID)
+  path: "meta-llama/Llama-2-7b-hf"
+  
+  # Model name for API responses (optional)
+  name: "llama-2-7b"
+  
+  # Revision/branch for HuggingFace models
+  revision: "main"
+  
+  # Data type: auto, float32, float16, bfloat16
+  dtype: "auto"
+  
+  # Device: auto, cpu, cuda, cuda:0, metal
+  device: "auto"
+  
+  # Maximum context length (optional, uses model default if not set)
+  # max_model_len: 4096
+  
+  # Trust remote code for custom models
+  trust_remote_code: false
+  
+  # Use memory-mapped files for weights
+  use_mmap: true
+  
+  # Tensor parallelism degree (for multi-GPU)
+  tensor_parallel_size: 1
+  
+  # Pipeline parallelism degree
+  pipeline_parallel_size: 1
+  
+  # Quantization (optional)
+  # quantization:
+  #   method: "awq"  # gptq, awq, bnb4, bnb8, fp8
+  #   bits: 4
+  #   group_size: 128
+
+server:
+  # Host to bind to
+  host: "0.0.0.0"
+  
+  # Port to listen on
+  port: 8000
+  
+  # API key for authentication (optional)
+  # api_key: "your-secret-key"
+  
+  # Request timeout in seconds
+  timeout_seconds: 300
+  
+  # Maximum concurrent connections
+  max_connections: 10000
+  
+  # Enable compression
+  compression: true
+  
+  # CORS configuration
+  cors:
+    enabled: true
+    allowed_origins:
+      - "*"
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "OPTIONS"
+    allowed_headers:
+      - "Content-Type"
+      - "Authorization"
+    max_age: 86400
+  
+  # TLS configuration (optional)
+  # tls:
+  #   cert_path: "/path/to/cert.pem"
+  #   key_path: "/path/to/key.pem"
+  
+  # Rate limiting (optional)
+  # rate_limit:
+  #   enabled: true
+  #   requests_per_minute: 60
+  #   burst: 10
+
+engine:
+  # Maximum number of concurrent sequences
+  max_num_seqs: 256
+  
+  # Maximum tokens per batch
+  max_num_batched_tokens: 8192
+  
+  # Block size for paged attention (power of 2)
+  block_size: 16
+  
+  # GPU memory utilization (0.0-1.0)
+  gpu_memory_utilization: 0.9
+  
+  # CPU swap space in GB
+  swap_space_gb: 4.0
+  
+  # Enable prefix caching for repeated prompts
+  enable_prefix_caching: false
+  
+  # Enable chunked prefill for long prompts
+  enable_chunked_prefill: false
+  
+  # Scheduling configuration
+  scheduling:
+    policy: "fcfs"  # fcfs, sjf, priority
+    enable_preemption: true
+    preemption_mode: "recompute"  # recompute, swap
+    max_waiting_time_seconds: 60.0
+  
+  # Default sampling parameters
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 256
+    repetition_penalty: 1.0
+  
+  # Speculative decoding (optional)
+  # speculative:
+  #   draft_model: "path/to/draft/model"
+  #   num_speculative_tokens: 5
+  #   acceptance_threshold: 0.9
+
+logging:
+  # Log level: trace, debug, info, warn, error
+  level: "info"
+  
+  # Log format: pretty, compact, json
+  format: "pretty"
+  
+  # Log file (optional)
+  # file: "/var/log/rusteeze/server.log"
+  
+  # Enable request logging
+  request_logging: true
+
+metrics:
+  # Enable metrics collection
+  enabled: true
+  
+  # Metrics endpoint path
+  path: "/metrics"
+  
+  # Enable Prometheus format
+  prometheus: true

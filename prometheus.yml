@@ -1,0 +1,32 @@
+# Prometheus configuration for Rusteeze
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files: []
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Rusteeze metrics
+  - job_name: 'rusteeze'
+    static_configs:
+      - targets: ['rusteeze:8000']
+    metrics_path: /metrics
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+  # GPU metrics (if using dcgm-exporter)
+  - job_name: 'gpu'
+    static_configs:
+      - targets: ['dcgm-exporter:9400']
+    scrape_interval: 5s
