@@ -44,6 +44,14 @@ parking_lot = { workspace = true }
 uuid = { version = "1.11", features = ["v4"] }
 rand = "0.8"
 indexmap = "2.7"
+smallvec = { version = "1.14", features = ["union", "const_generics"] }
+ahash = "0.8"
+priority-queue = "2.1"
+
+# SIMD and performance
+rayon = "1.10"
+num_cpus = "1.16"
+ordered-float = "4.5"
 
 [dev-dependencies]
 tokio-test = "0.4"

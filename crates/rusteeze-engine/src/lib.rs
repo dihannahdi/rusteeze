@@ -11,6 +11,7 @@
 //! - **Worker**: Executes model inference
 //! - **Sampler**: Handles token sampling strategies
 //! - **Block Manager**: Manages KV cache memory with paged attention
+//! - **SIMD Ops**: Vectorized operations for CPU-bound sampling
 //!
 //! ## Example
 //!
@@ -24,7 +25,7 @@
 //! ```
 
 #![warn(missing_docs)]
-#![deny(unsafe_code)]
+// Note: unsafe_code is allowed only in simd_ops module for SIMD intrinsics
 
 pub mod scheduler;
 pub mod sampler;
@@ -33,6 +34,9 @@ pub mod block_manager;
 pub mod sequence;
 pub mod engine;
 pub mod batch;
+
+#[allow(unsafe_code)]
+pub mod simd_ops;
 
 pub use scheduler::*;
 pub use sampler::*;

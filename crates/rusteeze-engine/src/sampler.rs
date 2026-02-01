@@ -2,6 +2,13 @@
 //!
 //! Provides various sampling strategies including temperature,
 //! top-k, top-p (nucleus), min-p, and Mirostat.
+//!
+//! ## Performance Optimizations
+//!
+//! This module uses SIMD-optimized operations where available:
+//! - Vectorized softmax computation
+//! - Fast top-k selection using partial sort
+//! - SIMD log-sum-exp for numerical stability
 
 use std::collections::HashMap;
 
@@ -13,6 +20,11 @@ use tracing::debug;
 
 use rusteeze_core::SamplingParams;
 use crate::sequence::{SequenceId, SequenceGroup};
+use crate::simd_ops::{
+    simd_argmax, simd_log_sum_exp, simd_softmax_inplace,
+    scale_logits_inplace, fast_topk, prepare_nucleus_sampling,
+    renormalize_probs, apply_repetition_penalty, apply_frequency_presence_penalty,
+};
 
 /// Sampling result for a single sequence.
 #[derive(Debug, Clone)]
@@ -357,11 +369,10 @@ impl Sampler {
         Ok((token_id as u32, logprob, top_logprobs))
     }
 
-    /// Compute log-sum-exp for normalization.
+    /// Compute log-sum-exp for normalization using SIMD when available.
+    #[inline]
     fn log_sum_exp(&self, logits: &[f32]) -> f32 {
-        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
-        max + sum.ln()
+        simd_log_sum_exp(logits)
     }
 
     /// Get top log probabilities if requested.
