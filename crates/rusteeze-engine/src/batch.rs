@@ -6,8 +6,18 @@ use std::collections::HashMap;
 
 use rusteeze_core::SamplingParams;
 
-use crate::scheduler::{ScheduledGroup, SchedulerOutput};
-use crate::sequence::{SequenceGroup, SequenceId};
+use crate::sequence::{GroupId, SequenceGroup, SequenceId};
+
+/// Scheduled group descriptor used by BatchBuilder.
+#[derive(Debug, Clone)]
+pub struct ScheduledGroup {
+    /// Group ID.
+    pub group_id: GroupId,
+    /// Sequence IDs in this group.
+    pub seq_ids: Vec<SequenceId>,
+    /// Whether this is a prefill step.
+    pub is_prefill: bool,
+}
 
 /// Input batch for model execution.
 #[derive(Debug)]
@@ -95,17 +105,17 @@ impl BatchBuilder {
         }
     }
 
-    /// Build batch from scheduler output.
+    /// Build batch from scheduled groups.
     pub fn build(
         &self,
-        output: &SchedulerOutput,
-        groups: &HashMap<crate::sequence::GroupId, &SequenceGroup>,
+        scheduled_groups: &[ScheduledGroup],
+        groups: &HashMap<GroupId, &SequenceGroup>,
         block_tables: &HashMap<SequenceId, Vec<usize>>,
     ) -> (Option<BatchInput>, Option<BatchInput>) {
         let mut prefill_batch = BatchInput::new(true);
         let mut decode_batch = BatchInput::new(false);
 
-        for scheduled in &output.scheduled_groups {
+        for scheduled in scheduled_groups {
             let group = match groups.get(&scheduled.group_id) {
                 Some(g) => *g,
                 None => continue,

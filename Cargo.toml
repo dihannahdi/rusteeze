@@ -46,7 +46,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 candle-core = { version = "0.8", features = [] }
 candle-nn = { version = "0.8" }
 candle-transformers = { version = "0.8" }
-candle-flash-attn = { version = "0.8", optional = true }
+candle-flash-attn = { version = "0.8" }
 safetensors = "0.5"
 memmap2 = "0.9"
 
@@ -128,8 +128,8 @@ fake = { version = "3.0", features = ["derive"] }
 wiremock = "0.6"
 tempfile = "3.16"
 
-# Profiling (optional)
-pprof = { version = "0.14", features = ["flamegraph", "protobuf-codec"], optional = true }
+# Profiling
+pprof = { version = "0.14", features = ["flamegraph", "protobuf-codec"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

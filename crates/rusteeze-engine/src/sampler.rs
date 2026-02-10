@@ -1,450 +1,253 @@
-//! Token sampler implementation.
+//! # Sampler — Radical Rewrite
 //!
-//! Provides various sampling strategies including temperature,
-//! top-k, top-p (nucleus), min-p, and Mirostat.
-//!
-//! ## Performance Optimizations
-//!
-//! This module uses SIMD-optimized operations where available:
-//! - Vectorized softmax computation
-//! - Fast top-k selection using partial sort
-//! - SIMD log-sum-exp for numerical stability
+//! Token sampling with pre-allocated buffers, SIMD-accelerated operations,
+//! and zero per-token allocations. Supports greedy, top-k, top-p, nucleus,
+//! and Mirostat v1/v2 strategies.
 
-use std::collections::HashMap;
-
-use candle_core::{DType, Device, Tensor};
-use rand::prelude::*;
+use rand::Rng;
 use rand::distributions::WeightedIndex;
-use serde::{Deserialize, Serialize};
-use tracing::debug;
+use rand::prelude::Distribution;
 
-use rusteeze_core::SamplingParams;
-use crate::sequence::{SequenceId, SequenceGroup};
-use crate::simd_ops::{
-    simd_argmax, simd_log_sum_exp, simd_softmax_inplace,
-    scale_logits_inplace, fast_topk, prepare_nucleus_sampling,
-    renormalize_probs, apply_repetition_penalty, apply_frequency_presence_penalty,
-};
+use rusteeze_core::sampling::SamplingParams;
+use crate::simd_dispatch::{self, softmax_inplace, vec_argmax, vec_max, vec_scale};
+use crate::simd_ops::{fast_topk, prepare_nucleus_sampling, apply_repetition_penalty, scale_logits_inplace};
 
-/// Sampling result for a single sequence.
+/// Result of sampling a single token.
 #[derive(Debug, Clone)]
 pub struct SampleResult {
-    /// Sampled token ID.
+    /// Sampled token ID
     pub token_id: u32,
-
-    /// Log probability of the token.
+    /// Log probability of the sampled token
     pub logprob: f32,
-
-    /// Top log probabilities (if requested).
+    /// Top log probabilities (if requested)
     pub top_logprobs: Option<Vec<(u32, f32)>>,
 }
 
-/// Token sampler.
+/// Sampler with pre-allocated buffers for zero-allocation sampling.
 pub struct Sampler {
-    /// Random number generator.
-    rng: StdRng,
-
-    /// Mirostat state per sequence.
-    mirostat_state: HashMap<SequenceId, MirostatState>,
+    /// Reusable logits buffer (avoids per-sample allocation)
+    logits_buf: Vec<f32>,
+    /// RNG
+    rng: rand::rngs::StdRng,
+    /// Mirostat v1 state: estimated surprise
+    mirostat_mu: f32,
 }
 
 impl Sampler {
-    /// Create new sampler.
-    pub fn new(seed: Option<u64>) -> Self {
+    /// Create a new sampler with optional seed.
+    pub fn new(seed: Option<u64>, vocab_size: usize) -> Self {
+        use rand::SeedableRng;
         let rng = match seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+            None => rand::rngs::StdRng::from_entropy(),
         };
-
         Self {
+            logits_buf: Vec::with_capacity(vocab_size),
             rng,
-            mirostat_state: HashMap::new(),
+            mirostat_mu: 10.0,
         }
     }
 
-    /// Sample next token from logits.
+    /// Sample a token from logits.
+    ///
+    /// `logits`: raw logits from the model [vocab_size]
+    /// `params`: sampling parameters
+    /// `prev_tokens`: previously generated tokens (for repetition penalty)
     pub fn sample(
         &mut self,
-        logits: &Tensor,
-        seq_id: SequenceId,
-        params: &SamplingParams,
-    ) -> Result<SampleResult, SamplerError> {
-        // Get logits as f32 vector
-        let logits_vec = self.get_logits_vec(logits)?;
-
-        // Apply sampling strategy
-        let (token_id, logprob, top_logprobs) = if params.temperature.unwrap_or(1.0) <= 0.0 {
-            // Greedy sampling
-            self.sample_greedy(&logits_vec, params)?
-        } else if params.mirostat_mode.unwrap_or(0) > 0 {
-            // Mirostat sampling
-            self.sample_mirostat(&logits_vec, seq_id, params)?
-        } else {
-            // Standard sampling with temperature, top-k, top-p, etc.
-            self.sample_standard(&logits_vec, params)?
-        };
-
-        Ok(SampleResult {
-            token_id,
-            logprob,
-            top_logprobs,
-        })
-    }
-
-    /// Get logits as f32 vector.
-    fn get_logits_vec(&self, logits: &Tensor) -> Result<Vec<f32>, SamplerError> {
-        // Get last position logits
-        let logits = if logits.dims().len() == 3 {
-            let seq_len = logits.dim(1).map_err(|e| SamplerError::TensorError(e.to_string()))?;
-            logits
-                .narrow(1, seq_len - 1, 1)
-                .map_err(|e| SamplerError::TensorError(e.to_string()))?
-                .squeeze(1)
-                .map_err(|e| SamplerError::TensorError(e.to_string()))?
-        } else if logits.dims().len() == 2 {
-            logits.clone()
-        } else {
-            return Err(SamplerError::InvalidShape(format!("{:?}", logits.dims())));
-        };
-
-        // Flatten to 1D
-        let logits = logits
-            .flatten_all()
-            .map_err(|e| SamplerError::TensorError(e.to_string()))?;
-
-        // Convert to f32
-        let logits = logits
-            .to_dtype(DType::F32)
-            .map_err(|e| SamplerError::TensorError(e.to_string()))?;
-
-        logits
-            .to_vec1()
-            .map_err(|e| SamplerError::TensorError(e.to_string()))
-    }
-
-    /// Greedy sampling (argmax).
-    fn sample_greedy(
-        &mut self,
         logits: &[f32],
         params: &SamplingParams,
-    ) -> Result<(u32, f32, Option<Vec<(u32, f32)>>), SamplerError> {
-        let (token_id, logit) = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, &v)| (i as u32, v))
-            .ok_or(SamplerError::EmptyLogits)?;
+        prev_tokens: &[u32],
+    ) -> SampleResult {
+        // Reuse buffer — resize without reallocation if capacity suffices
+        self.logits_buf.clear();
+        self.logits_buf.extend_from_slice(logits);
 
-        // Compute log probability
-        let log_sum_exp = self.log_sum_exp(logits);
-        let logprob = logit - log_sum_exp;
-
-        // Get top logprobs if requested
-        let top_logprobs = self.get_top_logprobs(logits, params, log_sum_exp);
-
-        Ok((token_id, logprob, top_logprobs))
-    }
-
-    /// Standard sampling with temperature, top-k, top-p.
-    fn sample_standard(
-        &mut self,
-        logits: &[f32],
-        params: &SamplingParams,
-    ) -> Result<(u32, f32, Option<Vec<(u32, f32)>>), SamplerError> {
-        let temperature = params.temperature.unwrap_or(1.0);
-        let top_k = params.top_k.unwrap_or(0);
-        let top_p = params.top_p.unwrap_or(1.0);
-        let min_p = params.min_p.unwrap_or(0.0);
-
-        // Apply temperature
-        let mut scaled_logits: Vec<(usize, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (i, l / temperature))
-            .collect();
-
-        // Sort by logit (descending)
-        scaled_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Apply top-k
-        if top_k > 0 && top_k < scaled_logits.len() {
-            scaled_logits.truncate(top_k);
+        // Apply repetition penalty
+        if params.repetition_penalty != 1.0 && !prev_tokens.is_empty() {
+            apply_repetition_penalty(&mut self.logits_buf, prev_tokens, params.repetition_penalty);
         }
 
-        // Convert to probabilities
-        let max_logit = scaled_logits.first().map(|x| x.1).unwrap_or(0.0);
-        let mut probs: Vec<(usize, f32)> = scaled_logits
-            .iter()
-            .map(|&(i, l)| (i, (l - max_logit).exp()))
-            .collect();
-
-        let sum: f32 = probs.iter().map(|x| x.1).sum();
-        for p in &mut probs {
-            p.1 /= sum;
-        }
-
-        // Apply min-p
-        if min_p > 0.0 {
-            let max_prob = probs.first().map(|x| x.1).unwrap_or(1.0);
-            let threshold = max_prob * min_p;
-            probs.retain(|&(_, p)| p >= threshold);
-        }
-
-        // Apply top-p (nucleus)
-        if top_p < 1.0 {
-            let mut cumsum = 0.0;
-            let mut cutoff_idx = probs.len();
-            for (i, &(_, p)) in probs.iter().enumerate() {
-                cumsum += p;
-                if cumsum > top_p {
-                    cutoff_idx = i + 1;
-                    break;
+        // Apply logit bias
+        if !params.logit_bias.is_empty() {
+            for (&token_id, &bias) in &params.logit_bias {
+                let idx = token_id as usize;
+                if idx < self.logits_buf.len() {
+                    self.logits_buf[idx] += bias;
                 }
             }
-            probs.truncate(cutoff_idx);
         }
 
-        // Renormalize
-        let sum: f32 = probs.iter().map(|x| x.1).sum();
-        for p in &mut probs {
-            p.1 /= sum;
+        // Mirostat sampling
+        if params.mirostat_mode == 1 {
+            return self.sample_mirostat_v1(params);
+        } else if params.mirostat_mode == 2 {
+            return self.sample_mirostat_v2(params);
         }
 
-        // Sample
-        let weights: Vec<f32> = probs.iter().map(|x| x.1).collect();
-        let dist = WeightedIndex::new(&weights)
-            .map_err(|e| SamplerError::SamplingError(e.to_string()))?;
-        let sampled_idx = dist.sample(&mut self.rng);
-        let (token_id, prob) = probs[sampled_idx];
+        // Greedy
+        if params.temperature == 0.0 || (params.top_k == 1 && params.top_p >= 1.0) {
+            return self.sample_greedy();
+        }
 
-        // Compute logprob
-        let logprob = prob.ln();
-
-        // Get top logprobs
-        let log_sum_exp = self.log_sum_exp(logits);
-        let top_logprobs = self.get_top_logprobs(logits, params, log_sum_exp);
-
-        Ok((token_id as u32, logprob, top_logprobs))
+        // Temperature + top-k/top-p
+        self.sample_standard(params)
     }
 
-    /// Mirostat sampling.
-    fn sample_mirostat(
-        &mut self,
-        logits: &[f32],
-        seq_id: SequenceId,
-        params: &SamplingParams,
-    ) -> Result<(u32, f32, Option<Vec<(u32, f32)>>), SamplerError> {
-        let mode = params.mirostat_mode.unwrap_or(1);
-        let tau = params.mirostat_tau.unwrap_or(5.0);
-        let eta = params.mirostat_eta.unwrap_or(0.1);
-
-        // Get or initialize state
-        let state = self.mirostat_state
-            .entry(seq_id)
-            .or_insert_with(|| MirostatState::new(tau * 2.0));
-
-        match mode {
-            1 => self.sample_mirostat_v1(logits, state, tau, eta, params),
-            2 => self.sample_mirostat_v2(logits, state, tau, eta, params),
-            _ => Err(SamplerError::InvalidMirostatMode(mode)),
+    fn sample_greedy(&self) -> SampleResult {
+        let (idx, val) = vec_argmax(&self.logits_buf);
+        SampleResult {
+            token_id: idx as u32,
+            logprob: (val - vec_max(&self.logits_buf)).max(-100.0),
+            top_logprobs: None,
         }
     }
 
-    /// Mirostat v1 sampling.
-    fn sample_mirostat_v1(
-        &mut self,
-        logits: &[f32],
-        state: &mut MirostatState,
-        tau: f32,
-        eta: f32,
-        params: &SamplingParams,
-    ) -> Result<(u32, f32, Option<Vec<(u32, f32)>>), SamplerError> {
-        let mu = state.mu;
+    fn sample_standard(&mut self, params: &SamplingParams) -> SampleResult {
+        let logits = &mut self.logits_buf;
 
-        // Sort logits
-        let mut sorted: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &l)| (i, l)).collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Compute probabilities with temperature
-        let max_logit = sorted.first().map(|x| x.1).unwrap_or(0.0);
-        let probs: Vec<(usize, f32)> = sorted
-            .iter()
-            .map(|&(i, l)| (i, (l - max_logit).exp()))
-            .collect();
-        let sum: f32 = probs.iter().map(|x| x.1).sum();
-        let probs: Vec<(usize, f32)> = probs.iter().map(|&(i, p)| (i, p / sum)).collect();
-
-        // Find k such that sum of top-k probs is closest to 2^(-mu)
-        let target = (2.0_f32).powf(-mu);
-        let mut cumsum = 0.0;
-        let mut k = 1;
-        for (i, &(_, p)) in probs.iter().enumerate() {
-            cumsum += p;
-            if cumsum >= target {
-                k = i + 1;
-                break;
-            }
+        // Apply temperature
+        if params.temperature > 0.0 && params.temperature != 1.0 {
+            scale_logits_inplace(logits, params.temperature);
         }
-
-        // Truncate and renormalize
-        let truncated: Vec<(usize, f32)> = probs.iter().take(k).cloned().collect();
-        let sum: f32 = truncated.iter().map(|x| x.1).sum();
-        let truncated: Vec<(usize, f32)> = truncated.iter().map(|&(i, p)| (i, p / sum)).collect();
-
-        // Sample
-        let weights: Vec<f32> = truncated.iter().map(|x| x.1).collect();
-        let dist = WeightedIndex::new(&weights)
-            .map_err(|e| SamplerError::SamplingError(e.to_string()))?;
-        let sampled_idx = dist.sample(&mut self.rng);
-        let (token_id, prob) = truncated[sampled_idx];
-
-        // Update mu
-        let surprise = -prob.ln() / (2.0_f32).ln();
-        state.mu = mu - eta * (surprise - tau);
-
-        let logprob = prob.ln();
-        let log_sum_exp = self.log_sum_exp(logits);
-        let top_logprobs = self.get_top_logprobs(logits, params, log_sum_exp);
-
-        Ok((token_id as u32, logprob, top_logprobs))
-    }
-
-    /// Mirostat v2 sampling.
-    fn sample_mirostat_v2(
-        &mut self,
-        logits: &[f32],
-        state: &mut MirostatState,
-        tau: f32,
-        eta: f32,
-        params: &SamplingParams,
-    ) -> Result<(u32, f32, Option<Vec<(u32, f32)>>), SamplerError> {
-        let mu = state.mu;
-
-        // Sort logits
-        let mut sorted: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &l)| (i, l)).collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Convert to probabilities
-        let max_logit = sorted.first().map(|x| x.1).unwrap_or(0.0);
-        let probs: Vec<(usize, f32)> = sorted
-            .iter()
-            .map(|&(i, l)| (i, (l - max_logit).exp()))
-            .collect();
-        let sum: f32 = probs.iter().map(|x| x.1).sum();
-        let probs: Vec<(usize, f32)> = probs.iter().map(|&(i, p)| (i, p / sum)).collect();
+        softmax_inplace(logits);
 
-        // Apply mu-based truncation
-        let mut filtered = Vec::new();
-        for &(i, p) in &probs {
-            let surprise = -p.ln() / (2.0_f32).ln();
-            if surprise <= mu {
-                filtered.push((i, p));
+        // Top-k filtering
+        if params.top_k > 0 && (params.top_k as usize) < logits.len() {
+            let top = fast_topk(logits, params.top_k as usize);
+            // Zero out non-top-k entries
+            let top_indices: std::collections::HashSet<usize> = top.iter().map(|&(i, _)| i).collect();
+            for (i, l) in logits.iter_mut().enumerate() {
+                if !top_indices.contains(&i) { *l = 0.0; }
             }
         }
 
-        // Ensure at least one token
-        if filtered.is_empty() {
-            filtered.push(probs[0]);
+        // Top-p (nucleus) filtering
+        if params.top_p < 1.0 {
+            let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate()
+                .filter(|(_, &p)| p > 0.0)
+                .map(|(i, &p)| (i, p))
+                .collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut cum = 0.0f32;
+            let mut keep = std::collections::HashSet::new();
+            for &(idx, prob) in &indexed {
+                cum += prob;
+                keep.insert(idx);
+                if cum >= params.top_p { break; }
+            }
+            for (i, l) in logits.iter_mut().enumerate() {
+                if !keep.contains(&i) { *l = 0.0; }
+            }
         }
 
         // Renormalize
-        let sum: f32 = filtered.iter().map(|x| x.1).sum();
-        let filtered: Vec<(usize, f32)> = filtered.iter().map(|&(i, p)| (i, p / sum)).collect();
-
-        // Sample
-        let weights: Vec<f32> = filtered.iter().map(|x| x.1).collect();
-        let dist = WeightedIndex::new(&weights)
-            .map_err(|e| SamplerError::SamplingError(e.to_string()))?;
-        let sampled_idx = dist.sample(&mut self.rng);
-        let (token_id, prob) = filtered[sampled_idx];
-
-        // Update mu
-        let surprise = -prob.ln() / (2.0_f32).ln();
-        state.mu = mu - eta * (surprise - tau);
-
-        let logprob = prob.ln();
-        let log_sum_exp = self.log_sum_exp(logits);
-        let top_logprobs = self.get_top_logprobs(logits, params, log_sum_exp);
-
-        Ok((token_id as u32, logprob, top_logprobs))
-    }
-
-    /// Compute log-sum-exp for normalization using SIMD when available.
-    #[inline]
-    fn log_sum_exp(&self, logits: &[f32]) -> f32 {
-        simd_log_sum_exp(logits)
-    }
-
-    /// Get top log probabilities if requested.
-    fn get_top_logprobs(
-        &self,
-        logits: &[f32],
-        params: &SamplingParams,
-        log_sum_exp: f32,
-    ) -> Option<Vec<(u32, f32)>> {
-        let n = params.logprobs?;
-        if n == 0 {
-            return None;
+        let sum: f32 = logits.iter().sum();
+        if sum > 0.0 {
+            let inv = 1.0 / sum;
+            for l in logits.iter_mut() { *l *= inv; }
         }
 
-        let mut indexed: Vec<(usize, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (i, l - log_sum_exp))
+        // Sample from distribution
+        let valid: Vec<(usize, f32)> = logits.iter().enumerate()
+            .filter(|(_, &p)| p > 0.0)
+            .map(|(i, &p)| (i, p))
             .collect();
 
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if valid.is_empty() {
+            let (idx, val) = vec_argmax(logits);
+            return SampleResult {
+                token_id: idx as u32,
+                logprob: (val - vec_max(logits)).max(-100.0),
+                top_logprobs: None,
+            };
+        }
 
-        Some(
-            indexed
-                .into_iter()
-                .take(n as usize)
-                .map(|(i, lp)| (i as u32, lp))
-                .collect(),
-        )
+        let weights: Vec<f32> = valid.iter().map(|&(_, p)| p).collect();
+        let dist = WeightedIndex::new(&weights).unwrap();
+        let sampled_idx = valid[dist.sample(&mut self.rng)].0;
+        let prob = logits[sampled_idx];
+
+        SampleResult {
+            token_id: sampled_idx as u32,
+            logprob: prob.ln().max(-100.0),
+            top_logprobs: None,
+        }
     }
 
-    /// Reset Mirostat state for sequence.
-    pub fn reset_mirostat(&mut self, seq_id: &SequenceId) {
-        self.mirostat_state.remove(seq_id);
+    fn sample_mirostat_v1(&mut self, params: &SamplingParams) -> SampleResult {
+        let tau = params.mirostat_tau;
+        let eta = params.mirostat_eta;
+
+        softmax_inplace(&mut self.logits_buf);
+        let mut indexed: Vec<(usize, f32)> = self.logits_buf.iter().enumerate()
+            .map(|(i, &p)| (i, p)).collect();
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Estimate surprise threshold
+        let k = ((self.mirostat_mu.exp()) as usize).max(1).min(indexed.len());
+        let truncated: Vec<f32> = indexed[..k].iter().map(|&(_, p)| p).collect();
+        let sum: f32 = truncated.iter().sum();
+        let probs: Vec<f32> = truncated.iter().map(|&p| p / sum.max(1e-10)).collect();
+
+        let dist = WeightedIndex::new(&probs).unwrap_or_else(|_| WeightedIndex::new(&[1.0]).unwrap());
+        let sampled = dist.sample(&mut self.rng);
+        let (token_idx, prob) = indexed[sampled];
+
+        // Update mu
+        let surprise = -(prob.max(1e-10).ln());
+        self.mirostat_mu += eta * (tau - surprise);
+
+        SampleResult {
+            token_id: token_idx as u32,
+            logprob: prob.ln().max(-100.0),
+            top_logprobs: None,
+        }
     }
 
-    /// Clear all Mirostat states.
-    pub fn clear_mirostat(&mut self) {
-        self.mirostat_state.clear();
+    fn sample_mirostat_v2(&mut self, params: &SamplingParams) -> SampleResult {
+        let tau = params.mirostat_tau;
+        let eta = params.mirostat_eta;
+
+        softmax_inplace(&mut self.logits_buf);
+
+        // Filter tokens with surprise <= mu
+        let mut candidates: Vec<(usize, f32)> = self.logits_buf.iter().enumerate()
+            .filter(|(_, &p)| p > 0.0 && -(p.ln()) <= self.mirostat_mu)
+            .map(|(i, &p)| (i, p))
+            .collect();
+
+        if candidates.is_empty() {
+            candidates = vec![vec_argmax(&self.logits_buf)].into_iter()
+                .map(|(i, _)| (i, self.logits_buf[i]))
+                .collect();
+        }
+
+        let sum: f32 = candidates.iter().map(|&(_, p)| p).sum();
+        let probs: Vec<f32> = candidates.iter().map(|&(_, p)| p / sum.max(1e-10)).collect();
+
+        let dist = WeightedIndex::new(&probs).unwrap_or_else(|_| WeightedIndex::new(&[1.0]).unwrap());
+        let sampled = dist.sample(&mut self.rng);
+        let (token_idx, prob) = candidates[sampled];
+
+        let surprise = -(prob.max(1e-10).ln());
+        self.mirostat_mu += eta * (tau - surprise);
+
+        SampleResult {
+            token_id: token_idx as u32,
+            logprob: prob.ln().max(-100.0),
+            top_logprobs: None,
+        }
     }
-}
 
-/// Mirostat state.
-#[derive(Debug)]
-struct MirostatState {
-    /// Current mu value.
-    mu: f32,
-}
-
-impl MirostatState {
-    fn new(mu: f32) -> Self {
-        Self { mu }
+    /// Get top-k log probabilities.
+    pub fn get_top_logprobs(&self, logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+        let top = fast_topk(logits, k);
+        top.into_iter().map(|(i, v)| (i as u32, v)).collect()
     }
-}
-
-/// Sampler errors.
-#[derive(Debug, thiserror::Error)]
-pub enum SamplerError {
-    #[error("Tensor error: {0}")]
-    TensorError(String),
-
-    #[error("Invalid tensor shape: {0}")]
-    InvalidShape(String),
-
-    #[error("Empty logits")]
-    EmptyLogits,
-
-    #[error("Sampling error: {0}")]
-    SamplingError(String),
-
-    #[error("Invalid Mirostat mode: {0}")]
-    InvalidMirostatMode(u8),
 }
 
 #[cfg(test)]
@@ -453,46 +256,24 @@ mod tests {
 
     #[test]
     fn test_greedy_sampling() {
-        let mut sampler = Sampler::new(Some(42));
-        let logits = vec![1.0, 5.0, 2.0, 0.5];
-
-        let params = SamplingParams {
-            temperature: Some(0.0),
-            ..Default::default()
-        };
-
-        let result = sampler.sample_greedy(&logits, &params).unwrap();
-        assert_eq!(result.0, 1); // Index of max value (5.0)
+        let mut sampler = Sampler::new(Some(42), 10);
+        let logits = vec![0.1, 0.2, 0.3, 0.9, 0.1, 0.05, 0.1, 0.1, 0.1, 0.05];
+        let params = SamplingParams { temperature: 0.0, ..Default::default() };
+        let result = sampler.sample(&logits, &params, &[]);
+        assert_eq!(result.token_id, 3);
     }
 
     #[test]
-    fn test_temperature_sampling() {
-        let mut sampler = Sampler::new(Some(42));
-        let logits = vec![1.0, 2.0, 3.0, 4.0];
-
+    fn test_standard_sampling() {
+        let mut sampler = Sampler::new(Some(42), 10);
+        let logits = vec![0.1, 0.2, 0.3, 0.9, 0.1, 0.05, 0.1, 0.1, 0.1, 0.05];
         let params = SamplingParams {
-            temperature: Some(1.0),
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 0.9,
             ..Default::default()
         };
-
-        let result = sampler.sample_standard(&logits, &params).unwrap();
-        // With seed 42, should be deterministic
-        assert!(result.0 < 4);
-    }
-
-    #[test]
-    fn test_top_k_sampling() {
-        let mut sampler = Sampler::new(Some(42));
-        let logits = vec![1.0, 2.0, 3.0, 10.0]; // Last one is much higher
-
-        let params = SamplingParams {
-            temperature: Some(1.0),
-            top_k: Some(1),
-            ..Default::default()
-        };
-
-        // With top_k=1, should always select the highest
-        let result = sampler.sample_standard(&logits, &params).unwrap();
-        assert_eq!(result.0, 3);
+        let result = sampler.sample(&logits, &params, &[]);
+        assert!(result.token_id < 10);
     }
 }

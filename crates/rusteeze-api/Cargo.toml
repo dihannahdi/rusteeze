@@ -34,10 +34,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 
+# Streaming
+async-stream = "0.3"
+
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 
 [dev-dependencies]
-axum-test = "0.9"
+axum-test = "18.0"

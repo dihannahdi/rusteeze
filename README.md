@@ -48,6 +48,7 @@ Rusteeze is an enterprise-grade LLM inference engine written entirely in Rust, d
 - **🔥 Flash Attention 2**: Optimized attention computation with 2-4x speedup
 - **🎯 Speculative Decoding**: Draft model acceleration for 2-3x faster generation
 - **🧠 Prefix Caching**: Automatic prompt caching for repeated prefixes
+- **🔄 Recursive Language Model (RLM) Engine**: Process 10M+ token prompts via recursive decomposition (based on [Zhang, Kraska, Khattab 2026](https://arxiv.org/abs/2512.24601))
 
 ### Model Support
 - **LLaMA** (1, 2, 3, 3.1, 3.2)
@@ -107,7 +108,77 @@ For a typical enterprise workload (1M requests/day):
 | AWS      | $80,000     | $4,000        | 95%     |
 | GCP      | $75,000     | $3,750        | 95%     |
 
-## 📦 Installation
+## � Recursive Language Model (RLM) Engine
+
+Rusteeze includes a first-of-its-kind **Recursive Language Model inference engine** in Rust, implementing the paradigm from ["Recursive Language Models" (Zhang, Kraska, Khattab 2026)](https://arxiv.org/abs/2512.24601).
+
+### How It Works
+
+Traditional LLMs are limited by their context window. RLMs break through this barrier by treating the prompt as an **external variable** rather than feeding it into the context window. The model interacts with the prompt via a REPL-like environment:
+
+```
+┌─────────────────────────────────────────────┐
+│  User Prompt (can be 10M+ tokens)           │
+│  Stored as variable, NOT in context window  │
+└──────────────────┬──────────────────────────┘
+                   │
+    ┌──────────────▼──────────────┐
+    │  RecursiveInferenceEngine   │
+    │  ┌──────────────────────┐   │
+    │  │ PromptEnvironment    │   │  ← REPL state
+    │  │ ┌──────────────────┐ │   │
+    │  │ │ VariableStore    │ │   │  ← Variables + metadata
+    │  │ └──────────────────┘ │   │
+    │  └──────────────────────┘   │
+    │  ┌──────────────────────┐   │
+    │  │ RecursiveScheduler   │   │  ← Call tree management
+    │  └──────────────────────┘   │
+    └──────────────┬──────────────┘
+                   │
+    Model receives ONLY metadata (constant size)
+    Model outputs operations: PEEK, DECOMPOSE,
+    SUBCALL, SEARCH, TRANSFORM, FINAL
+```
+
+### Key Operations
+
+| Operation | Description |
+|-----------|-------------|
+| `PEEK(start, end)` | View a slice of the prompt |
+| `DECOMPOSE(chunk_size, overlap)` | Split prompt into manageable chunks |
+| `SUBCALL(text, instruction)` | Recursively invoke model on a sub-problem |
+| `BATCH_SUBCALL(chunks, instruction)` | Process chunks in parallel |
+| `SEARCH(pattern)` | Search the prompt for patterns |
+| `TRANSFORM(source, target, op)` | Transform variables (split, join, filter, etc.) |
+| `FINAL(answer)` | Set the final output and terminate |
+
+### Usage
+
+```rust
+use rusteeze_engine::{
+    RecursiveInferenceEngine, RecursiveEngineConfig,
+    RecursiveRequest, InferenceModel, InferenceResult, InferenceError,
+};
+
+// Create engine
+let engine = RecursiveInferenceEngine::new(RecursiveEngineConfig::default());
+
+// Process a request (prompt can be arbitrarily long!)
+let request = RecursiveRequest {
+    request_id: "req-1".to_string(),
+    prompt: very_long_document, // 10M+ tokens OK
+    instruction: "Summarize this document".to_string(),
+    max_response_tokens: 4096,
+    config_override: None,
+};
+
+let response = engine.process(&request, &model)?;
+println!("Result: {}", response.response);
+println!("Stats: {} iterations, {} sub-calls", 
+    response.stats.root_iterations, response.stats.total_subcalls);
+```
+
+## �📦 Installation
 
 ### From Source
 

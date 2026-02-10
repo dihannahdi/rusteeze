@@ -76,14 +76,32 @@ impl WeightConverter {
 
     /// Convert HuggingFace naming to vLLM naming.
     fn hf_to_vllm(name: &str) -> String {
-        name.replace("model.", "")
-            .replace("layers.", "layers.")
-            .replace("self_attn.", "attn.")
-            .replace("q_proj", "qkv_proj")
-            .replace("k_proj", "qkv_proj")
-            .replace("v_proj", "qkv_proj")
-            .replace("mlp.gate_proj", "mlp.gate_up_proj")
-            .replace("mlp.up_proj", "mlp.gate_up_proj")
+        let mut result = name.replace("model.", "");
+        result = result.replace("self_attn.", "attn.");
+
+        // Handle QKV projection fusion: q_proj, k_proj, v_proj -> qkv_proj
+        // Must check BEFORE replacement to avoid cascading matches
+        if result.contains("q_proj") || result.contains("k_proj") || result.contains("v_proj") {
+            result = result
+                .replace("q_proj", "qkv_proj")
+                .replace("k_proj", "qkv_proj");
+            // v_proj must be replaced carefully since "qkv_proj" contains "v_proj"
+            // Only replace standalone v_proj (not the one inside qkv_proj)
+            if !result.contains("qkv_proj") {
+                result = result.replace("v_proj", "qkv_proj");
+            }
+        }
+
+        // Handle gate/up projection fusion
+        if result.contains("mlp.gate_proj") || result.contains("mlp.up_proj") {
+            if result.contains("mlp.gate_proj") {
+                result = result.replace("mlp.gate_proj", "mlp.gate_up_proj");
+            } else {
+                result = result.replace("mlp.up_proj", "mlp.gate_up_proj");
+            }
+        }
+
+        result
     }
 
     /// Convert vLLM naming to HuggingFace naming.

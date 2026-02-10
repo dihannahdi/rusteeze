@@ -34,6 +34,8 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 half = { workspace = true }
 num-traits = { workspace = true }
+bytemuck = { workspace = true }
+regex-lite = "0.1"
 
 # HuggingFace Hub (optional)
 hf-hub = { version = "0.3", optional = true }

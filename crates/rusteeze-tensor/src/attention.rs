@@ -110,12 +110,20 @@ pub enum AttentionMask {
 impl AttentionMask {
     /// Create a causal mask tensor.
     pub fn causal_mask(seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
-        let mask = Tensor::ones((seq_len, seq_len), dtype, device)?;
-        let mask = mask.tril(0)?;
+        // Build lower triangular mask manually (no tril in candle)
+        let mut mask_data = vec![0.0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..=i {
+                mask_data[i * seq_len + j] = 1.0;
+            }
+        }
+        let mask = Tensor::new(mask_data.as_slice(), device)?.reshape((seq_len, seq_len))?;
         // Convert to attention bias: 0 for attended, -inf for masked
+        // where_cond requires a U8 condition tensor
+        let mask_u8 = mask.to_dtype(DType::U8)?;
         let neg_inf = Tensor::new(&[f32::NEG_INFINITY], device)?.broadcast_as((seq_len, seq_len))?;
         let zero = Tensor::zeros((seq_len, seq_len), dtype, device)?;
-        mask.where_cond(&zero, &neg_inf)
+        mask_u8.where_cond(&zero, &neg_inf)
     }
 
     /// Create a sliding window causal mask.

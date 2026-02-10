@@ -288,18 +288,17 @@ impl SpecialTokens {
         let mut tokens = Self::default();
 
         // Try to get special tokens from added vocabulary
-        if let Some(added) = tokenizer.get_added_vocabulary() {
-            for (token, id) in added.get_vocab() {
-                let token_lower = token.to_lowercase();
-                if token_lower.contains("bos") || token_lower.contains("<s>") {
-                    tokens.bos_token_id = Some(*id);
-                } else if token_lower.contains("eos") || token_lower.contains("</s>") {
-                    tokens.eos_token_id = Some(*id);
-                } else if token_lower.contains("pad") {
-                    tokens.pad_token_id = Some(*id);
-                } else if token_lower.contains("unk") {
-                    tokens.unk_token_id = Some(*id);
-                }
+        let added = tokenizer.get_added_vocabulary();
+        for (token, id) in added.get_vocab() {
+            let token_lower: String = token.to_lowercase();
+            if token_lower.contains("bos") || token_lower.contains("<s>") {
+                tokens.bos_token_id = Some(*id);
+            } else if token_lower.contains("eos") || token_lower.contains("</s>") {
+                tokens.eos_token_id = Some(*id);
+            } else if token_lower.contains("pad") {
+                tokens.pad_token_id = Some(*id);
+            } else if token_lower.contains("unk") {
+                tokens.unk_token_id = Some(*id);
             }
         }
 

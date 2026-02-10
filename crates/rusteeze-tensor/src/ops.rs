@@ -33,11 +33,18 @@ pub fn gelu(x: &Tensor) -> Result<Tensor> {
 /// GELU activation (exact using erf)
 pub fn gelu_exact(x: &Tensor) -> Result<Tensor> {
     // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    // Using sigmoid approximation: sigmoid(1.702 * x) ≈ 0.5 * (1 + erf(x / sqrt(2)))
     let sqrt2_inv = 0.7071067811865476; // 1/sqrt(2)
     let scaled = (x * sqrt2_inv)?;
-    let erf = candle_nn::ops::sigmoid(&(scaled * 1.702)?)?; // Approximation
-    let result = (erf * 2.0 - 1.0)?;
-    let half = ((&result + 1.0)? * 0.5)?;
+    let sig = candle_nn::ops::sigmoid(&(scaled * 1.702)?)?;
+    // result = 2 * sig - 1
+    let two = Tensor::new(&[2.0f32], x.device())?.broadcast_as(sig.shape())?;
+    let one = Tensor::new(&[1.0f32], x.device())?.broadcast_as(sig.shape())?;
+    let result = (sig.broadcast_mul(&two)? - one)?;
+    // half = (result + 1) * 0.5
+    let one2 = Tensor::new(&[1.0f32], x.device())?.broadcast_as(result.shape())?;
+    let half_scalar = Tensor::new(&[0.5f32], x.device())?.broadcast_as(result.shape())?;
+    let half = ((result + one2)? * half_scalar)?;
     x.mul(&half)
 }
 
@@ -328,12 +335,19 @@ fn apply_rotary_to_tensor(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tens
 
 /// Causal masking utility
 pub fn create_causal_mask(seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
-    let mask = Tensor::ones((seq_len, seq_len), dtype, device)?;
-    let mask = mask.tril(0)?;
-    let neg_inf = f32::NEG_INFINITY;
-    let neg_inf_tensor = Tensor::full(neg_inf, (seq_len, seq_len), device)?.to_dtype(dtype)?;
+    // Build lower triangular mask manually
+    let mut mask_data = vec![0.0f32; seq_len * seq_len];
+    for i in 0..seq_len {
+        for j in 0..=i {
+            mask_data[i * seq_len + j] = 1.0;
+        }
+    }
+    let mask = Tensor::new(mask_data.as_slice(), device)?.reshape((seq_len, seq_len))?;
+    // where_cond requires a U8 condition tensor
+    let mask_u8 = mask.to_dtype(DType::U8)?;
+    let neg_inf_tensor = Tensor::full(f32::NEG_INFINITY, (seq_len, seq_len), device)?.to_dtype(dtype)?;
     let zero_tensor = Tensor::zeros((seq_len, seq_len), dtype, device)?;
-    mask.where_cond(&zero_tensor, &neg_inf_tensor)
+    mask_u8.where_cond(&zero_tensor, &neg_inf_tensor)
 }
 
 /// Top-k sampling helper

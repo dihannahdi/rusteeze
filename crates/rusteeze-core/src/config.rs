@@ -155,7 +155,7 @@ impl Default for ModelConfig {
             model_path: PathBuf::new(),
             model_name: None,
             revision: None,
-            dtype: DType::Auto,
+            dtype: DType::default(),
             device: DeviceType::Cuda,
             trust_remote_code: false,
             max_model_len: DEFAULT_MAX_MODEL_LEN,

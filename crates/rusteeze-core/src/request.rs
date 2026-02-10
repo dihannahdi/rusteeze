@@ -143,17 +143,21 @@ impl ChatCompletionRequest {
         SamplingParams {
             temperature: self.temperature.unwrap_or(1.0),
             top_p: self.top_p.unwrap_or(1.0),
-            top_k: self.top_k.unwrap_or(0),
+            top_k: self.top_k.map(|k| k as i32).unwrap_or(-1),
             max_tokens: self.effective_max_tokens(),
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
-            stop_sequences: self.stop.clone().map(|s| s.into_vec()).unwrap_or_default(),
+            stop: self.stop.clone().map(|s| s.into_vec()).unwrap_or_default(),
             seed: self.seed,
-            logit_bias: self.logit_bias.clone(),
+            logit_bias: self.logit_bias.clone()
+                .map(|map| map.into_iter()
+                    .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, v)))
+                    .collect())
+                .unwrap_or_default(),
             n: self.n.unwrap_or(1),
-            logprobs: self.logprobs.unwrap_or(false),
-            top_logprobs: self.top_logprobs,
+            logprobs: self.top_logprobs,
+            prompt_logprobs: if self.logprobs.unwrap_or(false) { Some(5) } else { None },
             ..Default::default()
         }
     }

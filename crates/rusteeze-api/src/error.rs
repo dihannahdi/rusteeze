@@ -19,8 +19,8 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
-    #[error("Rate limited")]
-    RateLimited,
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -28,8 +28,8 @@ pub enum ApiError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
-    #[error("Timeout")]
-    Timeout,
+    #[error("Timeout: {0}")]
+    Timeout(String),
 }
 
 impl ApiError {
@@ -39,10 +39,10 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 
@@ -52,10 +52,10 @@ impl ApiError {
             Self::BadRequest(_) => "invalid_request_error",
             Self::Unauthorized(_) => "authentication_error",
             Self::NotFound(_) => "not_found_error",
-            Self::RateLimited => "rate_limit_error",
+            Self::RateLimited(_) => "rate_limit_error",
             Self::Internal(_) => "server_error",
             Self::ServiceUnavailable(_) => "service_unavailable",
-            Self::Timeout => "timeout_error",
+            Self::Timeout(_) => "timeout_error",
         }
     }
 }
@@ -108,7 +108,7 @@ impl IntoResponse for ApiError {
 impl From<rusteeze_engine::EngineError> for ApiError {
     fn from(err: rusteeze_engine::EngineError) -> Self {
         match err {
-            rusteeze_engine::EngineError::Timeout => Self::Timeout,
+            rusteeze_engine::EngineError::Timeout => Self::Timeout("Request timed out".to_string()),
             rusteeze_engine::EngineError::Cancelled => Self::BadRequest("Request cancelled".to_string()),
             rusteeze_engine::EngineError::Shutdown => Self::ServiceUnavailable("Engine shutdown".to_string()),
             _ => Self::Internal(err.to_string()),

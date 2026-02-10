@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytemuck;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use memmap2::MmapOptions;
@@ -91,8 +92,8 @@ impl WeightFile {
             .ok()
             .and_then(|re| re.captures(filename))
         {
-            let index = caps.get(1).and_then(|m| m.as_str().parse().ok());
-            let total = caps.get(2).and_then(|m| m.as_str().parse().ok());
+            let index: Option<usize> = caps.get(1).and_then(|m: regex_lite::Match| m.as_str().parse().ok());
+            let total: Option<usize> = caps.get(2).and_then(|m: regex_lite::Match| m.as_str().parse().ok());
             return (index, total);
         }
 

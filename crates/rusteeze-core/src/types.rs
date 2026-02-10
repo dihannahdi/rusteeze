@@ -144,7 +144,7 @@ impl fmt::Display for RequestStatus {
 }
 
 /// Reason for finishing generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     /// Reached the end-of-sequence token

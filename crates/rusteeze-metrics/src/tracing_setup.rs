@@ -149,19 +149,17 @@ pub fn init_tracing_with_otlp(config: TracingConfig) -> Result<(), MetricsError>
         .clone()
         .unwrap_or_else(|| "http://localhost:4317".to_string());
 
-    // Create OTLP exporter
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(&endpoint)
-        .build()
-        .map_err(|e| MetricsError::TracingError(e.to_string()))?;
+    // Create OTLP exporter using new_exporter interface
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(&endpoint);
 
     // Create tracer provider
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .build();
-
-    let tracer = provider.tracer(config.service_name.clone());
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(exporter)
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+        .map_err(|e| MetricsError::TracingError(e.to_string()))?;
 
     // Create OpenTelemetry layer
     let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);

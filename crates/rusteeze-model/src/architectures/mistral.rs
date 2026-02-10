@@ -73,15 +73,15 @@ impl From<&ModelConfig> for MistralConfig {
         Self {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size.unwrap_or(config.hidden_size * 4),
+            intermediate_size: config.intermediate_size,
             num_hidden_layers: config.num_hidden_layers,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads.unwrap_or(config.num_attention_heads / 4),
-            max_position_embeddings: config.max_position_embeddings.unwrap_or(32768),
-            rms_norm_eps: config.rms_norm_eps.unwrap_or(1e-5),
-            rope_theta: config.rope_theta.unwrap_or(10000.0),
+            max_position_embeddings: config.max_position_embeddings,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta as f32,
             sliding_window: config.sliding_window,
-            tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
+            tie_word_embeddings: config.tie_word_embeddings,
         }
     }
 }

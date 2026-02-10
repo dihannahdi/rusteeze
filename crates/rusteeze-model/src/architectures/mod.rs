@@ -188,13 +188,13 @@ impl LayerKVCache {
     pub fn update(&mut self, new_key: &Tensor, new_value: &Tensor) -> Result<(), ModelError> {
         let seq_len = new_key.dim(2).map_err(|e| ModelError::TensorError(e.to_string()))?;
 
-        // Update key cache
-        self.key = self.key
+        // Update key cache using slice_set (modifies in place)
+        self.key
             .slice_set(new_key, 2, self.position)
             .map_err(|e| ModelError::TensorError(e.to_string()))?;
 
-        // Update value cache
-        self.value = self.value
+        // Update value cache using slice_set (modifies in place)
+        self.value
             .slice_set(new_value, 2, self.position)
             .map_err(|e| ModelError::TensorError(e.to_string()))?;
 
@@ -283,15 +283,14 @@ pub fn load_model(
     let vb = loader.load_weights()?;
 
     match model_config.architecture() {
-        Some(ModelArchitecture::Llama) | Some(ModelArchitecture::Llama2) | Some(ModelArchitecture::Llama3) => {
+        ModelArchitecture::Llama => {
             let model = LlamaModel::new(&model_config, vb)?;
             Ok(Arc::new(model))
         }
-        Some(ModelArchitecture::Mistral) => {
+        ModelArchitecture::Mistral => {
             let model = MistralModel::new(&model_config, vb)?;
             Ok(Arc::new(model))
         }
-        Some(arch) => Err(ModelError::UnsupportedArchitecture(format!("{:?}", arch))),
-        None => Err(ModelError::UnsupportedArchitecture("Unknown".to_string())),
+        arch => Err(ModelError::UnsupportedArchitecture(format!("{:?}", arch))),
     }
 }

@@ -290,7 +290,7 @@ impl Sequence {
 
     /// Check if sequence should stop on token.
     pub fn should_stop_on_token(&self, token_id: TokenId) -> bool {
-        self.sampling_params.stop_token_ids.contains(&token_id.0)
+        self.sampling_params.stop_token_ids.contains(&token_id)
     }
 
     /// Transition to running state.
@@ -655,7 +655,7 @@ mod tests {
         let params = Arc::new(SamplingParams::default());
         let seq = Sequence::new(
             RequestId::new(),
-            vec![TokenId(1), TokenId(2), TokenId(3)],
+            vec![1, 2, 3],
             params,
         );
 
@@ -670,23 +670,23 @@ mod tests {
         let params = Arc::new(SamplingParams::default().max_tokens(10));
         let mut seq = Sequence::new(
             RequestId::new(),
-            vec![TokenId(1)],
+            vec![1],
             params,
         );
 
-        seq.append_token(TokenId(100), -0.5);
-        seq.append_token(TokenId(101), -0.3);
+        seq.append_token(100, -0.5);
+        seq.append_token(101, -0.3);
 
         assert_eq!(seq.output_len(), 2);
         assert_eq!(seq.len(), 3);
-        assert_eq!(seq.last_token_id(), Some(TokenId(101)));
+        assert_eq!(seq.last_token_id(), Some(101));
         assert!(seq.first_token_at.is_some());
     }
 
     #[test]
     fn test_sequence_status() {
         let params = Arc::new(SamplingParams::default());
-        let mut seq = Sequence::new(RequestId::new(), vec![TokenId(1)], params);
+        let mut seq = Sequence::new(RequestId::new(), vec![1], params);
 
         assert!(seq.status.is_waiting());
         seq.set_running();
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn test_sequence_group() {
         let params = Arc::new(SamplingParams::default());
-        let seq = Sequence::new(RequestId::new(), vec![TokenId(1)], params.clone());
+        let seq = Sequence::new(RequestId::new(), vec![1], params.clone());
         let mut group = SequenceGroup::from_sequence(seq);
 
         assert_eq!(group.num_seqs(), 1);
@@ -714,8 +714,8 @@ mod tests {
     #[test]
     fn test_sequence_fork() {
         let params = Arc::new(SamplingParams::default());
-        let mut seq = Sequence::new(RequestId::new(), vec![TokenId(1)], params);
-        seq.append_token(TokenId(100), -0.5);
+        let mut seq = Sequence::new(RequestId::new(), vec![1], params);
+        seq.append_token(100, -0.5);
 
         let forked = seq.fork(None);
         assert_ne!(forked.seq_id, seq.seq_id);

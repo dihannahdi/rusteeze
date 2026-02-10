@@ -169,10 +169,10 @@ pub fn quantize_int8(tensor: &Tensor, per_channel: bool) -> Result<(Tensor, Quan
         // Quantize
         let scales_bc = scales.reshape((num_channels, 1))?;
         let zp_bc = zero_points.reshape((num_channels, 1))?;
-        let quantized = ((flat / &scales_bc)? + &zp_bc)?;
+        let quantized = (flat.broadcast_div(&scales_bc)?.broadcast_add(&zp_bc))?;
         let quantized = quantized.clamp(0.0, 255.0)?;
         let quantized = quantized.to_dtype(DType::U8)?;
-        let quantized = quantized.reshape(&shape)?;
+        let quantized = quantized.reshape(shape.as_slice())?;
 
         Ok((
             quantized,
@@ -198,7 +198,9 @@ pub fn quantize_int8(tensor: &Tensor, per_channel: bool) -> Result<(Tensor, Quan
         let scales = Tensor::new(&[scale], device)?;
         let zero_points = Tensor::new(&[zero_point], device)?;
 
-        let quantized = ((tensor - min_val)? / scale)?;
+        // Create scale tensor for division
+        let scale_tensor = Tensor::new(&[scale], device)?.broadcast_as(tensor.shape())?;
+        let quantized = ((tensor - min_val)? / scale_tensor)?;
         let quantized = quantized.clamp(0.0, 255.0)?;
         let quantized = quantized.to_dtype(DType::U8)?;
 
@@ -228,10 +230,11 @@ pub fn dequantize_int8(quantized: &Tensor, state: &QuantState) -> Result<Tensor>
             let num_channels = scales_float.dim(0)?;
             let scales_bc = scales_float.reshape((num_channels, 1))?;
             let zp_bc = zp_float.reshape((num_channels, 1))?;
-            let flat_shape = vec![num_channels, state.original_shape[1..].iter().product()];
-            let float_flat = float.reshape(&flat_shape)?;
-            let dequant = ((float_flat - zp_bc)? * scales_bc)?;
-            dequant.reshape(&state.original_shape)?.to_dtype(state.original_dtype)
+            let total_elements: usize = state.original_shape[1..].iter().product();
+            let flat_shape = (num_channels, total_elements);
+            let float_flat = float.reshape(flat_shape)?;
+            let dequant = float_flat.broadcast_sub(&zp_bc)?.broadcast_mul(&scales_bc)?;
+            dequant.reshape(state.original_shape.as_slice())?.to_dtype(state.original_dtype)
         } else {
             let dequant = ((float - zp_float)? * scales_float)?;
             dequant.to_dtype(state.original_dtype)
@@ -353,12 +356,13 @@ pub fn quantize_grouped(
     let max_range = 2.0f32.powi(bits as i32) - 1.0;
 
     let range = (&max_vals - &min_vals)?;
-    let scales = (&range / max_range)?;
+    let max_range_tensor = Tensor::new(&[max_range], device)?.broadcast_as(range.shape())?;
+    let scales = range.broadcast_div(&max_range_tensor)?;
 
     // Quantize
     let scales_bc = scales.unsqueeze(2)?;
     let min_bc = min_vals.unsqueeze(2)?;
-    let quantized = ((flat_grouped - min_bc)? / &scales_bc)?;
+    let quantized = flat_grouped.broadcast_sub(&min_bc)?.broadcast_div(&scales_bc)?;
     let quantized = quantized.clamp(0.0, max_range as f64)?;
 
     // Pack INT4 into bytes if needed
@@ -388,8 +392,10 @@ pub fn dequantize_grouped(quantized: &Tensor, state: &QuantState) -> Result<Tens
     let (rows, packed_cols) = quantized.dims2()?;
     let group_size = state.group_size;
 
-    // Unpack if INT4
-    let unpacked = if packed_cols * 2 > rows * state.original_shape.get(1).copied().unwrap_or(1) {
+    // Unpack if INT4: packed_cols will be half of the expected padded column count
+    let original_cols = state.original_shape.get(1).copied().unwrap_or(packed_cols);
+    let padded_cols = ((original_cols + group_size - 1) / group_size) * group_size;
+    let unpacked = if packed_cols * 2 == padded_cols {
         unpack_int4(quantized)?
     } else {
         quantized.to_dtype(DType::F32)?
@@ -404,7 +410,7 @@ pub fn dequantize_grouped(quantized: &Tensor, state: &QuantState) -> Result<Tens
     let zeros = state.zero_points.as_ref().unwrap().unsqueeze(2)?;
 
     // Dequantize: x = scale * quantized + zero
-    let dequant = ((unpacked * &scales)? + zeros)?;
+    let dequant = unpacked.broadcast_mul(&scales)?.broadcast_add(&zeros)?;
     
     // Reshape back to original
     let dequant = dequant.reshape((rows, cols))?;
@@ -417,7 +423,7 @@ pub fn dequantize_grouped(quantized: &Tensor, state: &QuantState) -> Result<Tens
         dequant
     };
 
-    dequant.reshape(&state.original_shape)?.to_dtype(state.original_dtype)
+    dequant.reshape(state.original_shape.as_slice())?.to_dtype(state.original_dtype)
 }
 
 /// Pack two 4-bit values into one byte.

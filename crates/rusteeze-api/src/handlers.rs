@@ -73,7 +73,8 @@ pub async fn chat_completions(
             FinishReason::Length => "length",
             FinishReason::ContentFilter => "content_filter",
             FinishReason::ToolCalls => "tool_calls",
-            FinishReason::Error => "error",
+            FinishReason::StopSequence => "stop",
+            _ => "stop",
         }.to_string()),
         logprobs: None,
     };
@@ -97,7 +98,7 @@ pub async fn chat_completions(
 pub async fn chat_completions_stream(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChatCompletionRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>> + Send>, ApiError> {
     debug!("Streaming chat completion request for model: {}", request.model);
 
     // Increment counter
@@ -230,15 +231,15 @@ fn build_prompt(messages: &[ChatMessage]) -> String {
 /// Build sampling params from request.
 fn build_sampling_params(request: &ChatCompletionRequest) -> SamplingParams {
     SamplingParams {
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: None,
-        min_p: None,
-        presence_penalty: request.presence_penalty,
-        frequency_penalty: request.frequency_penalty,
-        repetition_penalty: None,
+        temperature: request.temperature.unwrap_or(1.0),
+        top_p: request.top_p.unwrap_or(1.0),
+        top_k: -1,
+        min_p: 0.0,
+        presence_penalty: request.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
+        repetition_penalty: 1.0,
         seed: request.seed,
-        logprobs: request.top_logprobs.map(|n| n as u8),
+        logprobs: request.top_logprobs,
         ..Default::default()
     }
 }

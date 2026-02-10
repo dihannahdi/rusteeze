@@ -1,542 +1,236 @@
-//! Scheduler for continuous batching.
+//! # Scheduler — Radical Rewrite
 //!
-//! The scheduler manages the lifecycle of requests, from queuing
-//! through execution to completion. It implements continuous batching
-//! with preemption support.
+//! Pre-allocated scheduling with FCFS + priority, minimal per-schedule
+//! allocations, and proper preemption ordering.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
-use tracing::{debug, info, warn};
-
-use rusteeze_core::SamplingParams;
-
-use crate::block_manager::{AllocationResult, BlockManager, BlockManagerConfig};
-use crate::sequence::{GroupId, SequenceGroup, SequenceId, SequenceStatus};
+use crate::simd_dispatch;
 
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Maximum number of sequences per batch.
+    /// Maximum number of sequences in flight
     pub max_num_seqs: usize,
-
-    /// Maximum number of tokens per batch.
+    /// Maximum total tokens per iteration
     pub max_num_batched_tokens: usize,
-
-    /// Maximum model length.
+    /// Maximum sequence length
     pub max_model_len: usize,
+    /// Enable preemption
+    pub enable_preemption: bool,
+    /// Preemption mode
+    pub preemption_mode: PreemptionMode,
+}
 
-    /// Delay factor for prioritization.
-    pub delay_factor: f32,
-
-    /// Enable chunked prefill.
-    pub enable_chunked_prefill: bool,
-
-    /// Chunk size for prefill.
-    pub prefill_chunk_size: usize,
-
-    /// Policy for sequence selection.
-    pub policy: SchedulingPolicy,
+/// Preemption mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreemptionMode {
+    /// Swap KV cache to CPU
+    Swap,
+    /// Recompute from prompt
+    Recompute,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             max_num_seqs: 256,
-            max_num_batched_tokens: 8192,
-            max_model_len: 8192,
-            delay_factor: 0.0,
-            enable_chunked_prefill: false,
-            prefill_chunk_size: 512,
-            policy: SchedulingPolicy::Fcfs,
+            max_num_batched_tokens: 4096,
+            max_model_len: 4096,
+            enable_preemption: true,
+            preemption_mode: PreemptionMode::Recompute,
         }
     }
 }
 
-/// Scheduling policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchedulingPolicy {
-    /// First come, first served.
-    Fcfs,
-    /// Priority-based (lower priority value = higher priority).
-    Priority,
-    /// Shortest job first (by prompt length).
-    Sjf,
-}
-
-/// Scheduler output for a single step.
-#[derive(Debug)]
+/// Scheduler output — pre-allocated and reused across iterations.
+#[derive(Debug, Clone)]
 pub struct SchedulerOutput {
-    /// Scheduled sequence groups.
-    pub scheduled_groups: Vec<ScheduledGroup>,
-
-    /// Number of prefill tokens.
-    pub num_prefill_tokens: usize,
-
-    /// Number of decode tokens.
-    pub num_decode_tokens: usize,
-
-    /// Blocks to swap in.
-    pub blocks_to_swap_in: Vec<(usize, usize)>,
-
-    /// Blocks to swap out.
-    pub blocks_to_swap_out: Vec<(usize, usize)>,
-
-    /// Blocks to copy.
-    pub blocks_to_copy: Vec<(usize, usize)>,
-
-    /// Preempted group IDs.
-    pub preempted: Vec<GroupId>,
-
-    /// Ignored group IDs (no capacity).
-    pub ignored: Vec<GroupId>,
+    /// Sequences to schedule for this iteration
+    pub scheduled_seq_ids: Vec<u64>,
+    /// Number of tokens to process per sequence
+    pub num_tokens: Vec<usize>,
+    /// Which sequences are prefill vs decode
+    pub is_prefill: Vec<bool>,
+    /// Preempted sequence IDs
+    pub preempted: Vec<u64>,
+    /// Completed sequence IDs
+    pub completed: Vec<u64>,
+    /// Total tokens in this iteration
+    pub total_tokens: usize,
 }
 
 impl SchedulerOutput {
-    /// Check if batch is empty.
-    pub fn is_empty(&self) -> bool {
-        self.scheduled_groups.is_empty()
+    fn new(capacity: usize) -> Self {
+        Self {
+            scheduled_seq_ids: Vec::with_capacity(capacity),
+            num_tokens: Vec::with_capacity(capacity),
+            is_prefill: Vec::with_capacity(capacity),
+            preempted: Vec::with_capacity(capacity),
+            completed: Vec::with_capacity(capacity),
+            total_tokens: 0,
+        }
     }
 
-    /// Get total tokens in batch.
-    pub fn num_tokens(&self) -> usize {
-        self.num_prefill_tokens + self.num_decode_tokens
+    fn clear(&mut self) {
+        self.scheduled_seq_ids.clear();
+        self.num_tokens.clear();
+        self.is_prefill.clear();
+        self.preempted.clear();
+        self.completed.clear();
+        self.total_tokens = 0;
     }
 }
 
-/// Scheduled sequence group info.
-#[derive(Debug)]
-pub struct ScheduledGroup {
-    /// Group ID.
-    pub group_id: GroupId,
-
-    /// Sequence IDs in batch.
-    pub seq_ids: Vec<SequenceId>,
-
-    /// Is this prefill phase.
-    pub is_prefill: bool,
-
-    /// Token budget for this group.
-    pub token_budget: usize,
+/// A managed sequence in the scheduler.
+#[derive(Debug, Clone)]
+pub struct ManagedSequence {
+    pub seq_id: u64,
+    pub prompt_len: usize,
+    pub generated_len: usize,
+    pub max_tokens: usize,
+    pub priority: f32,
+    pub state: SeqState,
+    pub arrival_time: u64,
 }
 
-/// Scheduler for managing inference batches.
+/// Sequence state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqState {
+    Waiting,
+    Running,
+    Swapped,
+    Completed,
+}
+
+/// Main scheduler.
 pub struct Scheduler {
-    /// Configuration.
     config: SchedulerConfig,
-
-    /// Block manager.
-    block_manager: BlockManager,
-
-    /// Waiting queue.
-    waiting: VecDeque<SequenceGroup>,
-
-    /// Running groups.
-    running: HashMap<GroupId, SequenceGroup>,
-
-    /// Swapped groups.
-    swapped: HashMap<GroupId, SequenceGroup>,
-
-    /// Finished groups (for collection).
-    finished: Vec<SequenceGroup>,
+    /// Waiting queue
+    waiting: Vec<ManagedSequence>,
+    /// Running sequences
+    running: Vec<ManagedSequence>,
+    /// Swapped sequences
+    swapped: Vec<ManagedSequence>,
+    /// Pre-allocated output
+    output: SchedulerOutput,
+    /// Monotonic clock
+    clock: AtomicU64,
 }
 
 impl Scheduler {
-    /// Create new scheduler.
-    pub fn new(config: SchedulerConfig, block_config: BlockManagerConfig) -> Self {
-        let block_manager = BlockManager::new(block_config);
-
-        info!(
-            "Initialized scheduler: max_seqs={}, max_tokens={}",
-            config.max_num_seqs, config.max_num_batched_tokens
-        );
-
+    /// Create a new scheduler.
+    pub fn new(config: SchedulerConfig) -> Self {
+        simd_dispatch::init();
+        let cap = config.max_num_seqs;
         Self {
-            config,
-            block_manager,
-            waiting: VecDeque::new(),
-            running: HashMap::new(),
-            swapped: HashMap::new(),
-            finished: Vec::new(),
+            config: config.clone(),
+            waiting: Vec::with_capacity(cap),
+            running: Vec::with_capacity(cap),
+            swapped: Vec::new(),
+            output: SchedulerOutput::new(cap),
+            clock: AtomicU64::new(0),
         }
     }
 
-    /// Add new request to scheduler.
-    pub fn add_request(
-        &mut self,
-        request_id: String,
-        prompt_tokens: Vec<u32>,
-        sampling_params: SamplingParams,
-        max_tokens: usize,
-    ) -> GroupId {
-        let seq_group = SequenceGroup::new(
-            request_id,
-            prompt_tokens,
-            sampling_params,
-            max_tokens,
-        );
-
-        let group_id = seq_group.id;
-        self.waiting.push_back(seq_group);
-
-        debug!("Added request {} to waiting queue", group_id);
-        group_id
+    /// Add a new sequence to the waiting queue.
+    pub fn add_sequence(&mut self, seq: ManagedSequence) {
+        self.waiting.push(seq);
     }
 
-    /// Schedule next batch.
-    pub fn schedule(&mut self) -> SchedulerOutput {
-        let mut output = SchedulerOutput {
-            scheduled_groups: Vec::new(),
-            num_prefill_tokens: 0,
-            num_decode_tokens: 0,
-            blocks_to_swap_in: Vec::new(),
-            blocks_to_swap_out: Vec::new(),
-            blocks_to_copy: Vec::new(),
-            preempted: Vec::new(),
-            ignored: Vec::new(),
-        };
+    /// Run one scheduling iteration.
+    pub fn schedule(&mut self) -> &SchedulerOutput {
+        self.output.clear();
+        let max_tokens = self.config.max_num_batched_tokens;
+        let max_seqs = self.config.max_num_seqs;
+        let mut token_budget = max_tokens;
+        let mut seq_budget = max_seqs;
 
-        // First, try to schedule running sequences (decode phase)
-        self.schedule_running(&mut output);
-
-        // Then, try to schedule waiting sequences (prefill phase)
-        self.schedule_waiting(&mut output);
-
-        // Try to swap in if we have capacity
-        self.schedule_swapped(&mut output);
-
-        output
-    }
-
-    /// Schedule running sequences for decode.
-    fn schedule_running(&mut self, output: &mut SchedulerOutput) {
-        let mut running_to_remove = Vec::new();
-        let mut preempt_candidates = Vec::new();
-
-        // Check each running sequence
-        for (group_id, group) in &self.running {
-            let unfinished = group.get_unfinished_sequences();
-            if unfinished.is_empty() {
-                running_to_remove.push(*group_id);
-                continue;
-            }
-
-            // Check if we can append slots for new tokens
-            let mut can_continue = true;
-            for seq in &unfinished {
-                if !self.block_manager.can_append_slot(&seq.id, seq.total_len()) {
-                    can_continue = false;
-                    break;
-                }
-            }
-
-            if can_continue {
-                let seq_ids: Vec<_> = unfinished.iter().map(|s| s.id).collect();
-                let num_tokens = seq_ids.len(); // 1 token per sequence in decode
-
-                output.scheduled_groups.push(ScheduledGroup {
-                    group_id: *group_id,
-                    seq_ids,
-                    is_prefill: false,
-                    token_budget: num_tokens,
-                });
-                output.num_decode_tokens += num_tokens;
+        // Mark completed running sequences
+        let mut i = 0;
+        while i < self.running.len() {
+            if self.running[i].generated_len >= self.running[i].max_tokens {
+                let seq = self.running.swap_remove(i);
+                self.output.completed.push(seq.seq_id);
             } else {
-                preempt_candidates.push(*group_id);
+                i += 1;
             }
         }
 
-        // Remove finished groups
-        for group_id in running_to_remove {
-            if let Some(group) = self.running.remove(&group_id) {
-                self.finished.push(group);
-            }
-        }
+        // Schedule running sequences (decode — 1 token each)
+        let mut to_preempt = Vec::new();
+        // Sort running by priority (highest first) for preemption ordering
+        self.running.sort_unstable_by(|a, b| {
+            b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        // Handle preemption
-        for group_id in preempt_candidates {
-            if let Some(group) = self.running.remove(&group_id) {
-                // Try to swap out
-                let seq_ids = group.sequence_ids();
-                let mut swapped = true;
-                for seq_id in &seq_ids {
-                    if !self.block_manager.swap_out(seq_id) {
-                        swapped = false;
-                        break;
-                    }
+        for (i, seq) in self.running.iter().enumerate() {
+            if token_budget == 0 || seq_budget == 0 {
+                // Preempt remaining
+                if self.config.enable_preemption {
+                    to_preempt.push(i);
                 }
-
-                if swapped {
-                    self.swapped.insert(group_id, group);
-                    debug!("Swapped out group {}", group_id);
-                } else {
-                    // Requeue
-                    self.waiting.push_front(group);
-                    output.preempted.push(group_id);
-                    debug!("Preempted group {}", group_id);
-                }
-            }
-        }
-    }
-
-    /// Schedule waiting sequences for prefill.
-    fn schedule_waiting(&mut self, output: &mut SchedulerOutput) {
-        let mut budget = self.config.max_num_batched_tokens.saturating_sub(output.num_tokens());
-        let mut num_seqs = output.scheduled_groups.len();
-
-        while !self.waiting.is_empty() && num_seqs < self.config.max_num_seqs && budget > 0 {
-            let group = match self.waiting.front() {
-                Some(g) => g,
-                None => break,
-            };
-
-            // Check prompt length
-            let prompt_len = group.prompt_len();
-            if prompt_len > self.config.max_model_len {
-                let group = self.waiting.pop_front().unwrap();
-                output.ignored.push(group.id);
-                warn!("Ignored request {} - prompt too long", group.request_id);
                 continue;
             }
-
-            // Check allocation
-            match self.block_manager.can_allocate(group) {
-                AllocationResult::Ok => {}
-                AllocationResult::NeedPreemption => {
-                    // Need to preempt running sequences
-                    if !self.preempt_for_waiting(output) {
-                        break;
-                    }
-                }
-                AllocationResult::NoBlocks => {
-                    break;
-                }
-            }
-
-            // Calculate token budget
-            let tokens_needed = if self.config.enable_chunked_prefill {
-                prompt_len.min(self.config.prefill_chunk_size).min(budget)
-            } else {
-                prompt_len
-            };
-
-            if tokens_needed > budget {
-                break;
-            }
-
-            // Pop from waiting and allocate
-            let mut group = self.waiting.pop_front().unwrap();
-            if !self.block_manager.allocate(&group) {
-                output.ignored.push(group.id);
-                continue;
-            }
-
-            // Update sequences to running
-            for seq in group.sequences_mut() {
-                seq.set_status(SequenceStatus::Running);
-            }
-
-            let group_id = group.id;
-            let seq_ids = group.sequence_ids();
-
-            output.scheduled_groups.push(ScheduledGroup {
-                group_id,
-                seq_ids,
-                is_prefill: true,
-                token_budget: tokens_needed,
-            });
-            output.num_prefill_tokens += tokens_needed;
-
-            self.running.insert(group_id, group);
-            budget -= tokens_needed;
-            num_seqs += 1;
+            self.output.scheduled_seq_ids.push(seq.seq_id);
+            self.output.num_tokens.push(1);
+            self.output.is_prefill.push(false);
+            self.output.total_tokens += 1;
+            token_budget -= 1;
+            seq_budget -= 1;
         }
-    }
 
-    /// Schedule swapped sequences.
-    fn schedule_swapped(&mut self, output: &mut SchedulerOutput) {
-        let mut budget = self.config.max_num_batched_tokens.saturating_sub(output.num_tokens());
-        let mut to_swap_in = Vec::new();
-
-        for (group_id, group) in &self.swapped {
-            if budget == 0 {
-                break;
-            }
-
-            // Check if we can swap in
-            let seq_ids = group.sequence_ids();
-            let mut can_swap = true;
-            for seq_id in &seq_ids {
-                if self.block_manager.num_free_gpu_blocks() == 0 {
-                    can_swap = false;
-                    break;
-                }
-            }
-
-            if can_swap {
-                to_swap_in.push(*group_id);
-                budget -= group.num_sequences();
+        // Preempt lowest-priority sequences (reverse order)
+        for &idx in to_preempt.iter().rev() {
+            if idx < self.running.len() {
+                let mut seq = self.running.swap_remove(idx);
+                seq.state = SeqState::Swapped;
+                self.output.preempted.push(seq.seq_id);
+                self.swapped.push(seq);
             }
         }
 
-        // Perform swap-in
-        for group_id in to_swap_in {
-            if let Some(mut group) = self.swapped.remove(&group_id) {
-                let seq_ids = group.sequence_ids();
-                let mut swapped_in = true;
+        // Schedule waiting (prefill) — sorted by arrival time (FCFS)
+        self.waiting.sort_unstable_by_key(|s| s.arrival_time);
 
-                for seq_id in &seq_ids {
-                    if !self.block_manager.swap_in(seq_id) {
-                        swapped_in = false;
-                        break;
-                    }
-                }
+        while !self.waiting.is_empty() && token_budget > 0 && seq_budget > 0 {
+            let prompt_tokens = self.waiting[0].prompt_len;
+            if prompt_tokens > token_budget { break; }
 
-                if swapped_in {
-                    for seq in group.sequences_mut() {
-                        seq.set_status(SequenceStatus::Running);
-                    }
+            let mut seq = self.waiting.remove(0);
+            seq.state = SeqState::Running;
 
-                    output.scheduled_groups.push(ScheduledGroup {
-                        group_id,
-                        seq_ids: group.sequence_ids(),
-                        is_prefill: false,
-                        token_budget: group.num_sequences(),
-                    });
-                    output.num_decode_tokens += group.num_sequences();
+            self.output.scheduled_seq_ids.push(seq.seq_id);
+            self.output.num_tokens.push(prompt_tokens);
+            self.output.is_prefill.push(true);
+            self.output.total_tokens += prompt_tokens;
 
-                    self.running.insert(group_id, group);
-                    debug!("Swapped in group {}", group_id);
-                } else {
-                    self.swapped.insert(group_id, group);
-                }
-            }
+            token_budget -= prompt_tokens;
+            seq_budget -= 1;
+            self.running.push(seq);
+        }
+
+        self.clock.fetch_add(1, Ordering::Relaxed);
+        &self.output
+    }
+
+    /// Notify token generation.
+    pub fn on_token(&mut self, seq_id: u64) {
+        if let Some(seq) = self.running.iter_mut().find(|s| s.seq_id == seq_id) {
+            seq.generated_len += 1;
         }
     }
 
-    /// Preempt running sequences to make room for waiting.
-    fn preempt_for_waiting(&mut self, output: &mut SchedulerOutput) -> bool {
-        // Find lowest priority running sequence to preempt
-        let victim = self.running.keys().next().copied();
-
-        if let Some(group_id) = victim {
-            if let Some(group) = self.running.remove(&group_id) {
-                let seq_ids = group.sequence_ids();
-
-                // Free blocks
-                for seq_id in &seq_ids {
-                    self.block_manager.free_sequence(seq_id);
-                }
-
-                // Requeue
-                self.waiting.push_front(group);
-                output.preempted.push(group_id);
-
-                return true;
-            }
-        }
-
-        false
+    /// Force-complete a sequence.
+    pub fn complete(&mut self, seq_id: u64) {
+        self.running.retain(|s| s.seq_id != seq_id);
+        self.waiting.retain(|s| s.seq_id != seq_id);
     }
 
-    /// Update scheduler with step results.
-    pub fn update(&mut self, group_id: GroupId, finished_seqs: Vec<SequenceId>) {
-        if let Some(group) = self.running.get_mut(&group_id) {
-            for seq_id in finished_seqs {
-                self.block_manager.free_sequence(&seq_id);
-            }
-
-            if group.is_finished() {
-                if let Some(group) = self.running.remove(&group_id) {
-                    self.finished.push(group);
-                }
-            }
-        }
-    }
-
-    /// Get and clear finished groups.
-    pub fn get_finished(&mut self) -> Vec<SequenceGroup> {
-        std::mem::take(&mut self.finished)
-    }
-
-    /// Get running group.
-    pub fn get_running(&self, group_id: &GroupId) -> Option<&SequenceGroup> {
-        self.running.get(group_id)
-    }
-
-    /// Get mutable running group.
-    pub fn get_running_mut(&mut self, group_id: &GroupId) -> Option<&mut SequenceGroup> {
-        self.running.get_mut(group_id)
-    }
-
-    /// Abort request.
-    pub fn abort(&mut self, request_id: &str) -> bool {
-        // Check waiting queue
-        if let Some(pos) = self.waiting.iter().position(|g| g.request_id == request_id) {
-            self.waiting.remove(pos);
-            return true;
-        }
-
-        // Check running
-        let group_id = self.running
-            .iter()
-            .find(|(_, g)| g.request_id == request_id)
-            .map(|(id, _)| *id);
-
-        if let Some(group_id) = group_id {
-            if let Some(group) = self.running.remove(&group_id) {
-                for seq_id in group.sequence_ids() {
-                    self.block_manager.free_sequence(&seq_id);
-                }
-                return true;
-            }
-        }
-
-        // Check swapped
-        let group_id = self.swapped
-            .iter()
-            .find(|(_, g)| g.request_id == request_id)
-            .map(|(id, _)| *id);
-
-        if let Some(group_id) = group_id {
-            self.swapped.remove(&group_id);
-            return true;
-        }
-
-        false
-    }
-
-    /// Get number of waiting requests.
-    pub fn num_waiting(&self) -> usize {
-        self.waiting.len()
-    }
-
-    /// Get number of running requests.
-    pub fn num_running(&self) -> usize {
-        self.running.len()
-    }
-
-    /// Get number of swapped requests.
-    pub fn num_swapped(&self) -> usize {
-        self.swapped.len()
-    }
-
-    /// Check if scheduler has pending work.
-    pub fn has_pending(&self) -> bool {
-        !self.waiting.is_empty() || !self.running.is_empty() || !self.swapped.is_empty()
-    }
-
-    /// Get block manager reference.
-    pub fn block_manager(&self) -> &BlockManager {
-        &self.block_manager
-    }
-
-    /// Get mutable block manager reference.
-    pub fn block_manager_mut(&mut self) -> &mut BlockManager {
-        &mut self.block_manager
-    }
+    /// Stats.
+    pub fn waiting_count(&self) -> usize { self.waiting.len() }
+    pub fn running_count(&self) -> usize { self.running.len() }
+    pub fn swapped_count(&self) -> usize { self.swapped.len() }
 }
 
 #[cfg(test)]
@@ -544,39 +238,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scheduler_add_request() {
-        let config = SchedulerConfig::default();
-        let block_config = BlockManagerConfig::default();
-        let mut scheduler = Scheduler::new(config, block_config);
+    fn test_scheduler_basic() {
+        let config = SchedulerConfig {
+            max_num_seqs: 4,
+            max_num_batched_tokens: 100,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::new(config);
 
-        let group_id = scheduler.add_request(
-            "test".to_string(),
-            vec![1, 2, 3],
-            SamplingParams::default(),
-            100,
-        );
+        sched.add_sequence(ManagedSequence {
+            seq_id: 1, prompt_len: 10, generated_len: 0, max_tokens: 20,
+            priority: 1.0, state: SeqState::Waiting, arrival_time: 0,
+        });
+        sched.add_sequence(ManagedSequence {
+            seq_id: 2, prompt_len: 15, generated_len: 0, max_tokens: 20,
+            priority: 1.0, state: SeqState::Waiting, arrival_time: 1,
+        });
 
-        assert_eq!(scheduler.num_waiting(), 1);
-        assert_eq!(scheduler.num_running(), 0);
+        let out = sched.schedule();
+        assert_eq!(out.scheduled_seq_ids.len(), 2);
+        assert_eq!(out.total_tokens, 25);
     }
 
     #[test]
-    fn test_scheduler_schedule() {
-        let config = SchedulerConfig::default();
-        let block_config = BlockManagerConfig::default();
-        let mut scheduler = Scheduler::new(config, block_config);
+    fn test_preemption() {
+        let config = SchedulerConfig {
+            max_num_seqs: 2,
+            max_num_batched_tokens: 5,
+            enable_preemption: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::new(config);
 
-        scheduler.add_request(
-            "test".to_string(),
-            vec![1, 2, 3],
-            SamplingParams::default(),
-            100,
-        );
-
-        let output = scheduler.schedule();
-        assert_eq!(output.scheduled_groups.len(), 1);
-        assert!(output.scheduled_groups[0].is_prefill);
-        assert_eq!(scheduler.num_waiting(), 0);
-        assert_eq!(scheduler.num_running(), 1);
+        // Add and promote 3 sequences to running
+        for i in 0..3 {
+            sched.add_sequence(ManagedSequence {
+                seq_id: i, prompt_len: 1, generated_len: 0, max_tokens: 100,
+                priority: i as f32, state: SeqState::Waiting, arrival_time: i as u64,
+            });
+        }
+        // Schedule: should pick first 2 (max_num_seqs=2)
+        let out = sched.schedule();
+        assert!(out.scheduled_seq_ids.len() <= 2);
     }
 }

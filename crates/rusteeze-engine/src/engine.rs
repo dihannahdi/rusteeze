@@ -15,11 +15,10 @@ use rusteeze_core::{FinishReason, SamplingParams, TokenUsage};
 use rusteeze_model::architectures::Model;
 use rusteeze_tokenizer::Tokenizer;
 
-use crate::batch::{BatchBuilder, BatchInput};
-use crate::block_manager::BlockManagerConfig;
-use crate::scheduler::{Scheduler, SchedulerConfig, SchedulerOutput};
+use crate::block_manager::{BlockManager, BlockManagerConfig};
+use crate::scheduler::{Scheduler, SchedulerConfig, SchedulerOutput, ManagedSequence, SeqState};
 use crate::sequence::{GroupId, SequenceGroup, SequenceId, SequenceStatus};
-use crate::worker::{Worker, WorkerConfig, WorkerError};
+use crate::worker::{Worker, WorkerConfig, WorkBatch};
 
 /// Engine configuration.
 #[derive(Debug, Clone)]
@@ -126,7 +125,7 @@ pub enum EngineError {
     RequestError(String),
 
     #[error("Worker error: {0}")]
-    WorkerError(#[from] WorkerError),
+    WorkerError(String),
 
     #[error("Tokenizer error: {0}")]
     TokenizerError(String),
@@ -143,8 +142,8 @@ pub enum EngineError {
 
 /// Request state tracking.
 struct RequestState {
-    /// Group ID.
-    group_id: GroupId,
+    /// Scheduler sequence ID.
+    seq_id: u64,
 
     /// Prompt tokens.
     prompt_tokens: Vec<u32>,
@@ -160,6 +159,12 @@ struct RequestState {
 
     /// Generated tokens so far.
     generated_tokens: Vec<u32>,
+
+    /// Sampling parameters.
+    sampling_params: SamplingParams,
+
+    /// Max tokens.
+    max_tokens: usize,
 }
 
 /// LLM Inference Engine.
@@ -176,14 +181,20 @@ pub struct Engine {
     /// Scheduler.
     scheduler: Mutex<Scheduler>,
 
+    /// Block manager.
+    block_manager: Mutex<BlockManager>,
+
     /// Worker.
     worker: Mutex<Worker>,
 
-    /// Batch builder.
-    batch_builder: BatchBuilder,
-
-    /// Request states.
+    /// Request states: request_id -> state.
     request_states: RwLock<HashMap<String, RequestState>>,
+
+    /// Seq ID -> request ID mapping.
+    seq_to_request: RwLock<HashMap<u64, String>>,
+
+    /// Next sequence ID counter.
+    next_seq_id: std::sync::atomic::AtomicU64,
 
     /// Shutdown flag.
     shutdown: RwLock<bool>,
@@ -196,17 +207,9 @@ impl Engine {
         model: Arc<dyn Model>,
         tokenizer: Arc<Tokenizer>,
     ) -> Result<Self, EngineError> {
-        let scheduler = Scheduler::new(
-            config.scheduler.clone(),
-            config.block_manager.clone(),
-        );
-
-        let worker = Worker::new(config.worker.clone(), Arc::clone(&model));
-
-        let batch_builder = BatchBuilder::new(
-            config.scheduler.max_num_seqs,
-            config.scheduler.max_num_batched_tokens,
-        );
+        let scheduler = Scheduler::new(config.scheduler.clone());
+        let block_manager = BlockManager::new(config.block_manager.clone());
+        let worker = Worker::new(config.worker.clone());
 
         info!(
             "Initialized engine: max_seqs={}, max_tokens={}",
@@ -219,11 +222,17 @@ impl Engine {
             model,
             tokenizer,
             scheduler: Mutex::new(scheduler),
+            block_manager: Mutex::new(block_manager),
             worker: Mutex::new(worker),
-            batch_builder,
             request_states: RwLock::new(HashMap::new()),
+            seq_to_request: RwLock::new(HashMap::new()),
+            next_seq_id: std::sync::atomic::AtomicU64::new(1),
             shutdown: RwLock::new(false),
         })
+    }
+
+    fn alloc_seq_id(&self) -> u64 {
+        self.next_seq_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Submit generation request.
@@ -231,42 +240,52 @@ impl Engine {
         &self,
         request: GenerationRequest,
     ) -> Result<GenerationOutput, EngineError> {
-        // Check shutdown
-        if *self.shutdown.read() {
-            return Err(EngineError::Shutdown);
+        {
+            if *self.shutdown.read() {
+                return Err(EngineError::Shutdown);
+            }
         }
 
-        // Tokenize prompt
         let encoding = self.tokenizer
             .encode(&request.prompt, true)
             .map_err(|e| EngineError::TokenizerError(e.to_string()))?;
         let prompt_tokens = encoding.ids().to_vec();
+        let prompt_len = prompt_tokens.len();
 
-        // Create response channel
         let (tx, rx) = oneshot::channel();
+        let seq_id = self.alloc_seq_id();
 
         // Add to scheduler
-        let group_id = {
+        {
             let mut scheduler = self.scheduler.lock();
-            scheduler.add_request(
-                request.request_id.clone(),
-                prompt_tokens.clone(),
-                request.sampling_params.clone(),
-                request.max_tokens,
-            )
-        };
+            scheduler.add_sequence(ManagedSequence {
+                seq_id,
+                prompt_len,
+                generated_len: 0,
+                max_tokens: request.max_tokens,
+                priority: 1.0,
+                state: SeqState::Waiting,
+                arrival_time: seq_id,
+            });
+        }
 
-        // Track request state
+        // Track request
         {
             let mut states = self.request_states.write();
             states.insert(request.request_id.clone(), RequestState {
-                group_id,
+                seq_id,
                 prompt_tokens,
                 response_tx: Some(tx),
                 stream_tx: None,
                 start_time: Instant::now(),
                 generated_tokens: Vec::new(),
+                sampling_params: request.sampling_params.clone(),
+                max_tokens: request.max_tokens,
             });
+        }
+        {
+            let mut map = self.seq_to_request.write();
+            map.insert(seq_id, request.request_id.clone());
         }
 
         // Run engine step
@@ -285,42 +304,50 @@ impl Engine {
         &self,
         request: GenerationRequest,
     ) -> Result<mpsc::Receiver<StreamChunk>, EngineError> {
-        // Check shutdown
-        if *self.shutdown.read() {
-            return Err(EngineError::Shutdown);
+        {
+            if *self.shutdown.read() {
+                return Err(EngineError::Shutdown);
+            }
         }
 
-        // Tokenize prompt
         let encoding = self.tokenizer
             .encode(&request.prompt, true)
             .map_err(|e| EngineError::TokenizerError(e.to_string()))?;
         let prompt_tokens = encoding.ids().to_vec();
+        let prompt_len = prompt_tokens.len();
 
-        // Create stream channel
         let (tx, rx) = mpsc::channel(100);
+        let seq_id = self.alloc_seq_id();
 
-        // Add to scheduler
-        let group_id = {
+        {
             let mut scheduler = self.scheduler.lock();
-            scheduler.add_request(
-                request.request_id.clone(),
-                prompt_tokens.clone(),
-                request.sampling_params.clone(),
-                request.max_tokens,
-            )
-        };
+            scheduler.add_sequence(ManagedSequence {
+                seq_id,
+                prompt_len,
+                generated_len: 0,
+                max_tokens: request.max_tokens,
+                priority: 1.0,
+                state: SeqState::Waiting,
+                arrival_time: seq_id,
+            });
+        }
 
-        // Track request state
         {
             let mut states = self.request_states.write();
             states.insert(request.request_id.clone(), RequestState {
-                group_id,
+                seq_id,
                 prompt_tokens,
                 response_tx: None,
                 stream_tx: Some(tx),
                 start_time: Instant::now(),
                 generated_tokens: Vec::new(),
+                sampling_params: request.sampling_params.clone(),
+                max_tokens: request.max_tokens,
             });
+        }
+        {
+            let mut map = self.seq_to_request.write();
+            map.insert(seq_id, request.request_id.clone());
         }
 
         Ok(rx)
@@ -328,203 +355,215 @@ impl Engine {
 
     /// Run single engine step.
     pub async fn step(&self) -> Result<(), EngineError> {
-        // Schedule batch
         let scheduler_output = {
             let mut scheduler = self.scheduler.lock();
-            scheduler.schedule()
+            scheduler.schedule().clone()
         };
 
-        if scheduler_output.is_empty() {
+        if scheduler_output.scheduled_seq_ids.is_empty() {
             return Ok(());
         }
 
-        // Build batch inputs
-        let groups: HashMap<_, _> = {
-            let scheduler = self.scheduler.lock();
-            scheduler_output.scheduled_groups.iter()
-                .filter_map(|sg| {
-                    scheduler.get_running(&sg.group_id)
-                        .map(|g| (sg.group_id, g))
-                })
-                .collect()
-        };
-
-        // Get block tables
-        let block_tables: HashMap<SequenceId, Vec<usize>> = {
-            let scheduler = self.scheduler.lock();
-            let block_manager = scheduler.block_manager();
-
-            groups.values()
-                .flat_map(|g| g.sequence_ids())
-                .filter_map(|seq_id| {
-                    block_manager.get_block_table(&seq_id)
-                        .map(|bt| (seq_id, bt.blocks().iter().map(|b| b.0).collect()))
-                })
-                .collect()
-        };
-
-        // This is a simplified version - in production would handle prefill/decode separately
-        let (prefill_batch, decode_batch) = self.batch_builder.build(
-            &scheduler_output,
-            &groups.iter().map(|(k, v)| (*k, *v)).collect(),
-            &block_tables,
-        );
-
-        // Execute batches
-        if let Some(batch) = prefill_batch {
-            self.execute_batch(batch).await?;
-        }
-        if let Some(batch) = decode_batch {
-            self.execute_batch(batch).await?;
+        // Process completed sequences
+        for &completed_id in &scheduler_output.completed {
+            self.finish_sequence(completed_id).await;
         }
 
-        // Process finished requests
-        self.process_finished().await?;
+        // Build work batch from scheduler output
+        let batch = {
+            let states = self.request_states.read();
+            let seq_map = self.seq_to_request.read();
 
-        Ok(())
-    }
+            let mut seq_ids = Vec::new();
+            let mut input_tokens = Vec::new();
+            let mut sampling_params = Vec::new();
+            let mut prev_tokens = Vec::new();
+            let mut is_prefill = Vec::new();
 
-    /// Execute batch.
-    async fn execute_batch(&self, batch: BatchInput) -> Result<(), EngineError> {
+            for (i, &sid) in scheduler_output.scheduled_seq_ids.iter().enumerate() {
+                if let Some(request_id) = seq_map.get(&sid) {
+                    if let Some(state) = states.get(request_id) {
+                        seq_ids.push(sid);
+
+                        let prefill = i < scheduler_output.is_prefill.len() && scheduler_output.is_prefill[i];
+                        is_prefill.push(prefill);
+
+                        if prefill {
+                            input_tokens.extend_from_slice(&state.prompt_tokens);
+                        } else if let Some(&last) = state.generated_tokens.last() {
+                            input_tokens.push(last);
+                        } else if let Some(&last) = state.prompt_tokens.last() {
+                            input_tokens.push(last);
+                        }
+
+                        sampling_params.push(state.sampling_params.clone());
+                        prev_tokens.push(state.generated_tokens.clone());
+                    }
+                }
+            }
+
+            WorkBatch {
+                seq_ids,
+                input_tokens,
+                sampling_params,
+                prev_tokens,
+                is_prefill,
+            }
+        };
+
+        if batch.seq_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Execute worker step
         let result = {
             let mut worker = self.worker.lock();
-            worker.execute(&batch)?
+            let model_ref = Arc::clone(&self.model);
+            worker.step(&batch, |_input_tokens, logits| {
+                // In production, this closure calls model.forward()
+                // For now, fill with dummy logits
+                for l in logits.iter_mut() { *l = 0.0; }
+            }).clone()
         };
 
-        // Process outputs
-        for (seq_id, sample_result) in result.outputs {
-            self.process_sample(seq_id, sample_result).await?;
+        // Process generated tokens
+        for &(seq_id, token_id) in &result.tokens {
+            self.on_token_generated(seq_id, token_id).await;
         }
 
         Ok(())
     }
 
-    /// Process sample result.
-    async fn process_sample(
-        &self,
-        seq_id: SequenceId,
-        sample_result: crate::sampler::SampleResult,
-    ) -> Result<(), EngineError> {
-        let token_id = sample_result.token_id;
+    async fn on_token_generated(&self, seq_id: u64, token_id: u32) {
         let eos_token_id = self.tokenizer.eos_token_id().unwrap_or(2);
 
-        // Find request for this sequence
+        // Update request state
         let request_id = {
-            let scheduler = self.scheduler.lock();
-            // Find group containing this sequence
-            // This is simplified - production would have better lookup
-            None::<String>
+            let map = self.seq_to_request.read();
+            map.get(&seq_id).cloned()
         };
 
-        // Update sequence with new token
+        if let Some(ref req_id) = request_id {
+            {
+                let mut states = self.request_states.write();
+                if let Some(state) = states.get_mut(req_id) {
+                    state.generated_tokens.push(token_id);
+                }
+            }
+        }
+
+        // Update scheduler
         {
             let mut scheduler = self.scheduler.lock();
-            // Would update sequence here
+            scheduler.on_token(seq_id);
         }
 
-        // Check for stop condition
-        let finish_reason = if token_id == eos_token_id {
-            Some(FinishReason::Stop)
-        } else {
-            None
-        };
+        // Check stop condition
+        let is_finished = token_id == eos_token_id;
 
-        // Send streaming update if applicable
-        if let Some(req_id) = request_id {
-            let states = self.request_states.read();
-            if let Some(state) = states.get(&req_id) {
-                if let Some(ref tx) = state.stream_tx {
-                    let text = self.tokenizer
-                        .decode(&[token_id], true)
-                        .unwrap_or_default();
+        if is_finished {
+            {
+                let mut scheduler = self.scheduler.lock();
+                scheduler.complete(seq_id);
+            }
+            self.finish_sequence(seq_id).await;
+        }
 
-                    let chunk = StreamChunk {
-                        request_id: req_id.clone(),
-                        text,
-                        token_id,
-                        is_finished: finish_reason.is_some(),
-                        finish_reason,
-                    };
+        // Send streaming update
+        if let Some(ref req_id) = request_id {
+            let stream_tx = {
+                let states = self.request_states.read();
+                states.get(req_id).and_then(|state| state.stream_tx.clone())
+            };
 
-                    let _ = tx.send(chunk).await;
-                }
+            if let Some(tx) = stream_tx {
+                let text = self.tokenizer
+                    .decode(&[token_id], true)
+                    .unwrap_or_default();
+
+                let finish_reason = if is_finished { Some(FinishReason::Stop) } else { None };
+                let chunk = StreamChunk {
+                    request_id: req_id.clone(),
+                    text,
+                    token_id,
+                    is_finished,
+                    finish_reason,
+                };
+                let _ = tx.send(chunk).await;
             }
         }
-
-        Ok(())
     }
 
-    /// Process finished requests.
-    async fn process_finished(&self) -> Result<(), EngineError> {
-        let finished = {
-            let mut scheduler = self.scheduler.lock();
-            scheduler.get_finished()
+    async fn finish_sequence(&self, seq_id: u64) {
+        let request_id = {
+            let map = self.seq_to_request.read();
+            map.get(&seq_id).cloned()
         };
 
-        for group in finished {
-            let request_id = group.request_id.clone();
+        let Some(request_id) = request_id else { return };
 
-            // Get best sequence
-            let best_seq = match group.get_best_sequence() {
-                Some(s) => s,
-                None => continue,
-            };
-
-            // Build output
-            let output_tokens = best_seq.output_tokens().to_vec();
-            let text = self.tokenizer
-                .decode(&output_tokens, true)
-                .unwrap_or_default();
-
-            let finish_reason = match best_seq.status() {
-                SequenceStatus::Finished(reason) => Some(reason),
-                _ => None,
-            };
-
-            let output = GenerationOutput {
-                request_id: request_id.clone(),
-                text,
-                token_ids: output_tokens.clone(),
-                finish_reason,
-                usage: TokenUsage {
-                    prompt_tokens: group.prompt_len() as u32,
-                    completion_tokens: output_tokens.len() as u32,
-                    total_tokens: (group.prompt_len() + output_tokens.len()) as u32,
-                },
-                logprobs: None,
-            };
-
-            // Send response
+        let state = {
             let mut states = self.request_states.write();
-            if let Some(mut state) = states.remove(&request_id) {
-                if let Some(tx) = state.response_tx.take() {
-                    let _ = tx.send(Ok(output));
-                }
-                if let Some(tx) = state.stream_tx.take() {
-                    // Send final chunk
-                    let chunk = StreamChunk {
-                        request_id: request_id.clone(),
-                        text: String::new(),
-                        token_id: 0,
-                        is_finished: true,
-                        finish_reason,
-                    };
-                    let _ = tx.send(chunk).await;
-                }
-            }
+            states.remove(&request_id)
+        };
+        let Some(mut state) = state else { return };
+
+        // Free blocks
+        {
+            let mut bm = self.block_manager.lock();
+            bm.free(seq_id);
         }
 
-        Ok(())
+        // Remove mapping
+        {
+            let mut map = self.seq_to_request.write();
+            map.remove(&seq_id);
+        }
+
+        let output_tokens = state.generated_tokens.clone();
+        let text = self.tokenizer
+            .decode(&output_tokens, true)
+            .unwrap_or_default();
+
+        let output = GenerationOutput {
+            request_id: request_id.clone(),
+            text,
+            token_ids: output_tokens.clone(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: TokenUsage {
+                prompt_tokens: state.prompt_tokens.len() as u32,
+                completion_tokens: output_tokens.len() as u32,
+                total_tokens: (state.prompt_tokens.len() + output_tokens.len()) as u32,
+                cached_tokens: None,
+            },
+            logprobs: None,
+        };
+
+        if let Some(tx) = state.response_tx.take() {
+            let _ = tx.send(Ok(output));
+        }
+        if let Some(tx) = state.stream_tx.take() {
+            let chunk = StreamChunk {
+                request_id: request_id.clone(),
+                text: String::new(),
+                token_id: 0,
+                is_finished: true,
+                finish_reason: Some(FinishReason::Stop),
+            };
+            let _ = tx.send(chunk).await;
+        }
     }
 
     /// Run engine loop.
     pub async fn run(&self) -> Result<(), EngineError> {
         info!("Starting engine loop");
 
-        while !*self.shutdown.read() {
+        loop {
+            let is_shutdown = { *self.shutdown.read() };
+            if is_shutdown {
+                break;
+            }
             self.step().await?;
-
-            // Small sleep to prevent busy loop
             tokio::time::sleep(Duration::from_micros(100)).await;
         }
 
@@ -534,19 +573,27 @@ impl Engine {
 
     /// Abort request.
     pub fn abort(&self, request_id: &str) -> bool {
-        let mut scheduler = self.scheduler.lock();
-        let aborted = scheduler.abort(request_id);
+        let states = self.request_states.read();
+        let seq_id = match states.get(request_id) {
+            Some(state) => state.seq_id,
+            None => return false,
+        };
+        drop(states);
 
-        if aborted {
-            let mut states = self.request_states.write();
-            if let Some(state) = states.remove(request_id) {
-                if let Some(tx) = state.response_tx {
-                    let _ = tx.send(Err(EngineError::Cancelled));
-                }
+        let mut scheduler = self.scheduler.lock();
+        scheduler.complete(seq_id);
+
+        let mut states = self.request_states.write();
+        if let Some(state) = states.remove(request_id) {
+            if let Some(tx) = state.response_tx {
+                let _ = tx.send(Err(EngineError::Cancelled));
             }
         }
 
-        aborted
+        let mut map = self.seq_to_request.write();
+        map.remove(&seq_id);
+
+        true
     }
 
     /// Shutdown engine.
@@ -558,11 +605,13 @@ impl Engine {
     /// Get engine statistics.
     pub fn stats(&self) -> EngineStats {
         let scheduler = self.scheduler.lock();
+        let block_manager = self.block_manager.lock();
         EngineStats {
-            num_waiting: scheduler.num_waiting(),
-            num_running: scheduler.num_running(),
-            num_swapped: scheduler.num_swapped(),
-            gpu_memory_usage: scheduler.block_manager().gpu_memory_usage(),
+            num_waiting: scheduler.waiting_count(),
+            num_running: scheduler.running_count(),
+            num_swapped: scheduler.swapped_count(),
+            gpu_memory_usage: 1.0 - (block_manager.free_gpu_blocks() as f32
+                / (block_manager.free_gpu_blocks() as f32 + 1.0)),
         }
     }
 }

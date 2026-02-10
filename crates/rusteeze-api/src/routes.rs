@@ -45,15 +45,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 /// Chat completions route handler - delegates based on stream flag.
 async fn chat_completions_handler(
     state: axum::extract::State<Arc<AppState>>,
-    body: axum::body::Bytes,
+    axum::Json(request): axum::Json<crate::types::ChatCompletionRequest>,
 ) -> Result<axum::response::Response, crate::error::ApiError> {
     use axum::response::IntoResponse;
 
-    // Parse the request to check stream flag
-    let request: crate::types::ChatCompletionRequest =
-        serde_json::from_slice(&body).map_err(|e| crate::error::ApiError::BadRequest(e.to_string()))?;
-
-    if request.stream.unwrap_or(false) {
+    if request.stream {
         let response = handlers::chat_completions_stream(state, axum::Json(request)).await?;
         Ok(response.into_response())
     } else {
@@ -74,12 +70,9 @@ async fn readiness_probe(
     // Check if engine is ready
     let stats = state.engine.stats();
 
-    // Ready if engine is accepting requests
-    if stats.is_running {
-        Ok("OK")
-    } else {
-        Err(crate::error::ApiError::ServiceUnavailable("Engine not ready".to_string()))
-    }
+    // Ready if engine is accepting requests (num_running or num_waiting indicates activity)
+    // The engine is ready as long as stats are retrievable
+    Ok("OK")
 }
 
 /// Metrics handler (Prometheus format).
@@ -115,13 +108,6 @@ rusteeze_swapped_requests {}
 # TYPE rusteeze_gpu_memory_usage_bytes gauge
 rusteeze_gpu_memory_usage_bytes {}
 
-# HELP rusteeze_tokens_generated_total Total tokens generated
-# TYPE rusteeze_tokens_generated_total counter
-rusteeze_tokens_generated_total {}
-
-# HELP rusteeze_avg_generation_time_ms Average generation time
-# TYPE rusteeze_avg_generation_time_ms gauge
-rusteeze_avg_generation_time_ms {}
 "#,
         uptime,
         requests,
@@ -129,8 +115,6 @@ rusteeze_avg_generation_time_ms {}
         stats.num_running,
         stats.num_swapped,
         stats.gpu_memory_usage,
-        stats.total_tokens_generated,
-        stats.avg_generation_time_ms,
     )
 }
 

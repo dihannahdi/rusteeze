@@ -69,14 +69,14 @@ impl From<&ModelConfig> for LlamaConfig {
         Self {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size.unwrap_or(config.hidden_size * 4),
+            intermediate_size: config.intermediate_size,
             num_hidden_layers: config.num_hidden_layers,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads.unwrap_or(config.num_attention_heads),
-            max_position_embeddings: config.max_position_embeddings.unwrap_or(4096),
-            rms_norm_eps: config.rms_norm_eps.unwrap_or(1e-5),
-            rope_theta: config.rope_theta.unwrap_or(10000.0),
-            tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
+            max_position_embeddings: config.max_position_embeddings,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta as f32,
+            tie_word_embeddings: config.tie_word_embeddings,
         }
     }
 }
@@ -414,8 +414,8 @@ mod tests {
             num_hidden_layers: 32,
             num_attention_heads: 32,
             num_key_value_heads: Some(8),
-            intermediate_size: Some(14336),
-            max_position_embeddings: Some(8192),
+            intermediate_size: 14336,
+            max_position_embeddings: 8192,
             ..Default::default()
         };
 

@@ -28,7 +28,8 @@
 //! ```
 
 #![warn(missing_docs)]
-#![deny(unsafe_code)]
+// Note: Unsafe is allowed only for memory mapping in loader.rs
+#![allow(unsafe_code)]
 
 pub mod config;
 pub mod loader;

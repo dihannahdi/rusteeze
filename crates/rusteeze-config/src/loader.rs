@@ -83,8 +83,8 @@ impl ConfigLoader {
 
     /// Load the configuration.
     pub fn load(self) -> Result<Config, ConfigError> {
-        // Start with defaults
-        let mut config = self.defaults;
+        // Start with defaults (clone to avoid move)
+        let mut config = self.defaults.clone();
 
         // Load from file if specified
         if let Some(ref path) = self.file_path {

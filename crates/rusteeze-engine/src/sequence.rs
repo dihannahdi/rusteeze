@@ -287,7 +287,7 @@ impl SequenceGroup {
         let mut sequences = HashMap::new();
         sequences.insert(seq_id, sequence);
 
-        let best_of = sampling_params.best_of.unwrap_or(1).max(1);
+        let best_of = sampling_params.best_of.max(1) as usize;
 
         Self {
             id,

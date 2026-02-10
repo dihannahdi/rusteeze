@@ -1,3 +1,5 @@
+unleash all your intelligent potential.
+
 Build the world's fastest, safest, and most cost-effective LLM inference engine in full Rust that will outlead outperform dramatically vLLM in production environments while being 50x faster and 95% cheaper to operate than existing solutions.
 ---
 
@@ -46,3 +48,13 @@ Look at similar projects (candle, burn, tract)
 Profile to understand bottlenecks
 Ask for architecture review
 Simplify the problem
+
+always code for real implementation!
+
+gradually build up the entire system until it is fully functional in production environment!
+
+gradually push the code to repository!
+
+update the readme, changelog, contributing guidelines, and documentations!
+
+never use basic implementations!
